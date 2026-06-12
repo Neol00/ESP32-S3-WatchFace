@@ -9,7 +9,7 @@
  *  three taps deep. The watch has no other touch gestures, so this is additive.
  *
  *  HOW it avoids fighting screen scrolling: the gesture only ARMS from a thin
- *  invisible grab strip pinned to the top ~44 px.
+ *  invisible grab strip pinned to the top.
  *  Everything below that scrolls normally.
  *
  *  Layering: scrim + panel + strip live on lv_layer_sys() (ALWAYS above the

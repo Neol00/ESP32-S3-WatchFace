@@ -54,12 +54,43 @@ public:
   void writeIndexedPixelsDouble(uint8_t *data, uint16_t *idx, uint32_t len) override;
   void writeYCbCrPixels(uint8_t *yData, uint8_t *cbData, uint8_t *crData, uint16_t w, uint16_t h) override;
 
+  // LOCAL PATCH (ESP32-S3-WatchFace): ASYNC whole-area pixel write. `data` must be
+  // DMA-capable (internal SRAM) and ALREADY in panel byte order (big-endian RGB565).
+  // Queues the whole area as a few large DMA transactions and returns immediately;
+  // `done_cb(done_arg)` fires from the SPI transfer-done ISR after the LAST segment
+  // (keep it trivial — it's interrupt context). Returns false (nothing sent) if the
+  // area needs more than ASYNC_MAX_SEG segments — caller should fall back to the
+  // sync writePixels() path. Any sync bus call transparently waits out an in-flight
+  // async write first (drain hook in CS_LOW), so commands can't interleave a tile.
+  bool writePixelsBeAsync(const uint8_t *data, uint32_t len, void (*done_cb)(void *), void *done_arg);
+  void waitAsync(); // block until no async write is in flight (reaps queued results)
+
 protected:
 private:
   GFX_INLINE void CS_HIGH(void);
   GFX_INLINE void CS_LOW(void);
   GFX_INLINE void POLL_START();
   GFX_INLINE void POLL_END();
+
+  // LOCAL PATCH (ESP32-S3-WatchFace): async write plumbing. The S3's SPI peripheral
+  // caps one transaction at 2^18 bits (32 KB), so a tile is split into up to
+  // ASYNC_MAX_SEG queued segments sharing ONE CS bracket: the pre/post transaction
+  // callbacks drive CS (and fire done_cb) only on the segments flagged first/last.
+  // Sync paths leave trans.user NULL so the callbacks ignore them.
+  struct AsyncSeg
+  {
+    Arduino_ESP32QSPI *bus;
+    bool first;
+    bool last;
+  };
+  static void _async_pre_cb(spi_transaction_t *t);
+  static void _async_post_cb(spi_transaction_t *t);
+  static const int ASYNC_MAX_SEG = 4;
+  spi_transaction_ext_t _async_tran[ASYNC_MAX_SEG];
+  AsyncSeg _async_seg[ASYNC_MAX_SEG];
+  volatile uint8_t _async_pending = 0; // queued-but-unreaped async transactions
+  void (*_async_done_cb)(void *) = nullptr;
+  void *_async_done_arg = nullptr;
 
   int8_t _cs, _sck, _mosi, _miso, _quadwp, _quadhd;
   bool _is_shared_interface;

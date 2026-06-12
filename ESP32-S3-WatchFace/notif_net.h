@@ -90,7 +90,10 @@ static bool wifi_connect(void) {
       if (millis() - start > WIFI_CONNECT_TIMEOUT_MS) break;
       delay(100);
     }
-    if (WiFi.status() == WL_CONNECTED) return true;
+    if (WiFi.status() == WL_CONNECTED) {
+      settings_apply_wifi_txp();   // driver restarts per fetch and resets TX power
+      return true;
+    }
     WiFi.disconnect(false);
   }
   return false;

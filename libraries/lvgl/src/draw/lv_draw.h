@@ -91,6 +91,15 @@ typedef enum {
     /** The draw task is rendered. It will be removed from the draw task list of the layer
      * and freed automatically. */
     LV_DRAW_TASK_STATE_FINISHED,
+
+    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): the task is already
+     * linked into the layer's task list but its draw dsc is still being filled in
+     * by the UI thread (between lv_draw_add_task and the end of
+     * lv_draw_finalize_task_creation). Render workers scan the list concurrently
+     * and must never claim such a task; as a non-FINISHED state it still blocks
+     * overlapping later tasks in is_independent(). Released to WAITING (or left
+     * BLOCKED for layer-blend tasks) at the end of finalize. */
+    LV_DRAW_TASK_STATE_BUILDING,
 } lv_draw_task_state_t;
 
 struct _lv_layer_t  {

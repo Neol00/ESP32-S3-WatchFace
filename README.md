@@ -2,9 +2,10 @@
 
 A from-scratch smartwatch firmware for the **Waveshare ESP32-S3-Touch-AMOLED-2.06**.
 It is a real little OS in miniature: a watch face, an app launcher, a notification
-pipeline that pulls from both an HTTPS server **and** via IOS over BLE, deep-sleep
-power management with a timed background-fetch wake, and a Player that mirrors and
-controls iPhone media — all in a single Arduino translation unit on top of LVGL.
+pipeline that pulls from an HTTPS server **and** from your phone over BLE (iOS via
+ANCS, Android via the Gadgetbridge app), deep-sleep power management with a timed
+background-fetch wake, and a Player that mirrors and controls iPhone or Android
+media — all in a single Arduino translation unit on top of LVGL.
 
 > **Supported hardware:** the Waveshare **ESP32-S3-Touch-AMOLED-2.06** only, for now.
 > Every pin map, the CO5300 panel driver, the FT3168 touch controller, the PCF85063
@@ -14,19 +15,41 @@ controls iPhone media — all in a single Arduino translation unit on top of LVG
 
 ---
 
+## Screenshots
+
+<table>
+  <tr>
+    <td align="center"><img src="WatchFace-Screenshots/watchface0.png" width="200"><br>Watch face</td>
+    <td align="center"><img src="WatchFace-Screenshots/watchface1.png" width="200"><br>Watch face (alt)</td>
+    <td align="center"><img src="WatchFace-Screenshots/dim.png" width="200"><br>Dimmed / minimal face</td>
+    <td align="center"><img src="WatchFace-Screenshots/appmenu.png" width="200"><br>App launcher</td>
+  </tr>
+  <tr>
+    <td align="center"><img src="WatchFace-Screenshots/notifapp.png" width="200"><br>Notifications</td>
+    <td align="center"><img src="WatchFace-Screenshots/powerapp.png" width="200"><br>Power</td>
+    <td align="center"><img src="WatchFace-Screenshots/appearanceapp.png" width="200"><br>Appearance</td>
+    <td align="center"><img src="WatchFace-Screenshots/findphoneapp.png" width="200"><br>Find Phone</td>
+  </tr>
+</table>
+
+---
+
 ## Table of contents
+- [Screenshots](#screenshots)
 - [Installation](#installation)
   - [1. Install the Arduino IDE](#1-install-the-arduino-ide)
   - [2. Place the bundled libraries](#2-place-the-bundled-libraries)
   - [3. Install the ESP32 core (Espressif Systems)](#3-install-the-esp32-core-espressif-systems)
-  - [4. Apply the library patches](#4-apply-the-library-patches)
-  - [5. Board settings & compile](#5-board-settings--compile)
+  - [4. Install esp32-s3-lib](#4-install-esp32-s3-lib)
+  - [5. Apply the library patches](#5-apply-the-library-patches)
+  - [6. Board settings & compile](#6-board-settings--compile)
 - [Hardware](#hardware)
 - [Architecture overview](#architecture-overview)
 - [Deep sleep & the timed wake](#deep-sleep--the-timed-wake)
 - [The notification pipeline](#the-notification-pipeline)
   - [Path A — HTTPS notify server](#path-a--https-notify-server)
   - [Path B — iPhone over BLE (ANCS)](#path-b--iphone-over-ble-ancs)
+  - [Path C — Android over BLE (Gadgetbridge)](#path-c--android-over-ble-gadgetbridge)
   - [Media control over BLE (AMS)](#media-control-over-ble-ams)
 - [Storage (SD card vs flash)](#storage-sd-card-vs-flash)
 - [Experimental: overclocking & undervolting](#experimental-overclocking--undervolting)
@@ -61,7 +84,7 @@ Launch it once so it creates your sketchbook folder (the place your libraries li
 
 ### 2. Place the bundled libraries
 
-Copy the **contents** of this repo's `libraries/` folder into your Arduino
+Place the **contents** of `libraries/` folder into your Arduino
 **`libraries/`** folder, so the library folders and `lv_conf.h` land directly inside it.
 
 The result must look like this (note `lv_conf.h` sits **next to** the `lvgl` folder, not
@@ -98,12 +121,11 @@ cp -r ./libraries/* ~/Arduino/libraries/
 The ESP32 core is **not** bundled (it's large) — install it from the Boards Manager.
 **Use the Espressif Systems core, _not_ the legacy "Arduino ESP32 Boards" entry.**
 
-1. **File → Preferences → Additional boards manager URLs**, add:
-   ```
-   https://espressif.github.io/arduino-esp32/package_esp32_index.json
-   ```
-2. **Tools → Board → Boards Manager…**, search **esp32**.
-3. Install the entry **"esp32" by Espressif Systems**, version **3.3.8** (pick 3.3.8 in
+1. **Tools → Board → Board Manager**, search and add:
+```
+esp32
+```
+2. Install the entry **"esp32" by Espressif Systems**, version **3.3.8** (pick 3.3.8 in
    the version dropdown — the patches target that exact version).
 
 > ⚠️ There are two similarly-named entries. Choose **esp32 by _Espressif Systems_**.
@@ -117,10 +139,36 @@ This is also the step that puts the ESP32 core (with its `BLE` library) on disk 
 
 You'll point the patch step at that folder next.
 
-### 4. Apply the library patches
+### 4. Install esp32-s3-lib
+ 
+Delete the old directory
 
-The firmware relies on **5 small modifications** to LVGL, Arduino_GFX, and the ESP32
-core's BLE library. They live outside the sketch, so they must be applied once — without
+**Windows**
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\Arduino15\packages\esp32\tools\esp32s3-libs"
+```
+
+**Linux**
+```bash
+rm -rf ~/.arduino15/packages/esp32/tools/esp32s3-libs
+```
+
+place the directory included in this repo `esp32-s3-libs` inside:
+ 
+**Windows**
+```powershell
+%LOCALAPPDATA%\Arduino15\packages\esp32\tools\
+```
+
+**Linux**
+```bash
+~/.arduino15/packages/esp32/tools/
+```
+
+### 5. Apply the library patches
+
+The firmware relies on modifications to LVGL, Arduino_GFX, and the ESP32
+core (its `BLE` and `ESP_I2S` libraries plus `Esp.cpp`). They live outside the sketch, so they must be applied once — without
 them the build fails or the watch misbehaves (crash on BLE toggle, single-core
 rendering, no screen cache). Full details and a per-patch table are in
 [`patches/README.md`](patches/README.md).
@@ -132,8 +180,7 @@ wouldn't apply cleanly (usually a version mismatch — install the exact version
 **Windows** (PowerShell — needs `git` on PATH, which the toolchain provides):
 ```powershell
 cd .\patches
-./apply_patches.ps1 -LibrariesDir "$HOME\Documents\Arduino\libraries" `
-                    -Esp32CoreDir "$env:LOCALAPPDATA\Arduino15\packages\esp32\hardware\esp32\3.3.8"
+./apply_patches.ps1
 ```
 
 **Linux** (bash — needs the `patch` tool, e.g. `sudo apt install patch`):
@@ -151,7 +198,7 @@ After patching, **clear the Arduino build cache** so the patched libraries recom
 - **Windows:** delete `%LOCALAPPDATA%\arduino\sketches\*`
 - **Linux:** delete `~/.cache/arduino/sketches/*`
 
-### 5. Board settings & compile
+### 6. Board settings & compile
 
 Open **`ESP32-S3-WatchFace/ESP32-S3-WatchFace.ino`** in the Arduino IDE. The **exact
 board settings are documented in a comment block at the very top of that file** — set
@@ -175,9 +222,10 @@ board settings are documented in a comment block at the very top of that file** 
 
 Then **Verify** (compile) and **Upload**.
 
-- **First-time clock set:** to set the time once, uncomment the `rtc.setDateTime(...)`
-  line in `setup()`, set your current time, flash, then re-comment it. The PCF85063 RTC
-  is battery-backed and keeps time after that (and NTP re-syncs it whenever WiFi is up).
+- **First-time clock set:** connect to a WiFi network to sync the RTC automatically,
+  or set `FORCE_TIME_SET` to 1, set your current time, and flash. The PCF85063 RTC
+  is battery-backed and keeps time after that (NTP re-syncs it whenever WiFi is up,
+  and an Android phone pushes time over BLE on every Gadgetbridge connect).
 - **Upload trouble?** Hold **BOOT**, tap **RST**, release **BOOT** → download mode, then
   upload again.
 - **microSD recommended:** format a card FAT32 and insert it for notification history,
@@ -190,25 +238,12 @@ Then **Verify** (compile) and **Upload**.
 
 | Part | Chip | Bus | Notes |
 |------|------|-----|-------|
-| MCU | ESP32-S3R8 | — | dual-core LX7, 8 MB OPI PSRAM, ~80 KB usable internal SRAM, 32 MB flash |
+| MCU | ESP32-S3R8 | — | dual-core LX7, 8 MB OPI PSRAM, 512 KB internal SRAM, 32 MB flash |
 | Display | CO5300 AMOLED 410×502 | QSPI @ 80 MHz | command-driven (no autonomous scan-out) |
 | Touch | FT3168 capacitive | I²C | shared bus |
 | RTC | PCF85063 | I²C | battery-backed; keeps time across power loss |
 | IMU | QMI8658 | I²C | shared bus |
 | PMU / charger | AXP2101 | I²C | per-rail LDO control; drives deep-sleep power gating |
-
-The I²C bus is shared between touch, RTC, IMU and PMU; access is serialized with
-`i2c_lock()` because the network task (core 0) and the UI (core 1) both touch it.
-
-### Why the display matters for performance
-The CO5300 is **QSPI command-driven**: there is no framebuffer scanning out on its
-own, so the CPU must push every pixel over QSPI for every frame. That makes the panel
-the rendering ceiling, and shapes two design choices:
-- **PARTIAL render mode**: LVGL renders into small internal-SRAM line buffers and
-  `my_disp_flush` pushes only the dirty rectangle, instead of blitting a full ~410 KB
-  PSRAM framebuffer every frame.
-- **Dual-core software rendering**: `LV_DRAW_SW_DRAW_UNIT_CNT = 2` plus a one-line
-  patch pinning LVGL's render thread to core 0 lets both cores rasterize in parallel.
 
 ---
 
@@ -334,7 +369,7 @@ So rails are classified at **runtime** by a crash-safe probe (`rails_probe()`):
 
 ## The notification pipeline
 
-Notifications converge from **two independent sources** into one shared store
+Notifications converge from **three independent sources** into one shared store
 (`notif_store.h` — a newest-32 NVS cache — backed by an unlimited archive on SD, or on
 a flash FAT partition when there's no card). The UI never cares where a notification
 came from; it just reads the store and the popup card.
@@ -358,8 +393,9 @@ A self-hosted server queues notifications; the watch GETs them over **TLS**
 
 ### Path B — iPhone over BLE (ANCS)
 **ANCS (Apple Notification Center Service)** is built into iOS and exposed to any
-bonded BLE accessory — Companion app is also available for extra features. Here the watch is the GATT
-**client** (the inverse of the rest of its BLE code, which is a server). `ble_ancs.h`:
+bonded BLE accessory — A companion app is available for extra features and easy connection.
+Here the watch is the GATT **client** (the inverse of the rest
+of its BLE code, which is a server). `ble_ancs.h`:
 
 1. On an **encrypted + bonded** link, discover the ANCS service and its three
    characteristics:
@@ -411,6 +447,28 @@ buttons write 1-byte commands (play / pause / toggle / next / prev) back to the 
 Remote Command characteristic. So the watch both **mirrors** now-playing metadata and
 **controls** iPhone playback, over the same bonded link used for notifications.
 
+### Path C — Android over BLE (Gadgetbridge)
+Android has no ANCS equivalent — notifications are only visible to an *app* on the
+phone, so one has to forward them. The watch speaks the **Bangle.js protocol** used by
+**[Gadgetbridge](https://gadgetbridge.org/)** (free, open source, on F-Droid): a Nordic
+UART Service on the watch to which the phone writes newline-terminated JSON lines
+(`ble_gadgetbridge.h`). Unlike ANCS, here the watch is the GATT **server**.
+
+What works with an Android phone today:
+- **Notifications** — posted and dismissed-on-phone events flow into the same store
+  and popup path as ANCS/HTTPS; per-app categories work via the app name.
+- **Media** — now-playing metadata and play/pause/next/prev from the Player app
+  control whatever Android app is playing (Gadgetbridge media-session bridge).
+- **Time sync** — Gadgetbridge pushes the time + timezone on every connect, so the
+  RTC stays synced with WiFi off.
+- **Find My Phone / Find My Watch** and **battery reporting** to the Gadgetbridge
+  device card.
+
+**Setup:** install Gadgetbridge on the phone you have to use F-droid, the app does not
+exist on the play store. scan for the watch in discovery from inside the Gadgetbridge app
+list, and pick **"Bangle.js"** as the device type (long-press the ESP32-S3-WatchFace then click
+on "Add test device" then "Select device" and select "Bangle.js" in the list, then press ok).
+
 ---
 
 ## Storage (SD card vs flash)
@@ -425,7 +483,7 @@ and fall back to on-board flash otherwise:
 - **FFat flash partition** — with no card (or a card that won't mount), the firmware
   transparently uses the on-board FAT partition in flash instead, so every feature
   still works. The notification archive is then bounded by the flash partition size
-  (~16 MB) rather than the card's capacity.
+  (~24 MB) rather than the card's capacity.
 
 In both cases the newest-32 notification **cache** also lives in NVS, so the
 instant-wake popup path needs no mount; the archive (SD or FFat) is the source of
@@ -517,13 +575,13 @@ back/menu key (clock → menu → app → back out). Current apps:
 
 | App | Icon | What it does |
 |-----|------|--------------|
-| **Notifications** | 🔔 | Unified list/reader for both HTTPS and ANCS notifications; dismiss (clears on phone too via ANCS) |
+| **Notifications** | 🔔 | Unified list/reader for HTTPS, ANCS (iPhone) and Gadgetbridge (Android) notifications; dismiss (clears on an iPhone too via ANCS) |
 | **Timer** | 🔁 | Countdown timer + stopwatch; a running countdown arms a precise deep-sleep timer wake so the alarm fires on time |
 | **Appearance** | 🎨 | Accent color / theme (mono-accent mode); restyles the live UI immediately |
 | **Power** | 🔋 | Battery %, charge state, power estimates, the duty-cycle/floor-current learner, CPU usage, voltages, per-rail sleep-cut toggles, background-check toggle, battery-health proxy, change CPU clock speed |
 | **WiFi & BLE** | 📶 | Toggle radios, saved WiFi networks, BLE pairing (shows the pair code), bonded phones |
-| **Player** | 🎵 | iPhone now-playing (AMS): track/artist + transport controls |
-| **Find Phone** | 📞 | Ping companion phone app so it rings |
+| **Player** | 🎵 | Now-playing (iPhone via AMS, Android via Gadgetbridge): track/artist + transport controls |
+| **Find Phone** | 📞 | Ring the phone (Gadgetbridge on Android, or a companion app) |
 | **Files** | 💾 | Browse the SD card / flash FAT storage |
 | **About** | 📋 | Live spec sheet: chip/flash/PSRAM, per-pool SRAM & PSRAM free, SD usage, battery health, and auto-reported library versions |
 
@@ -558,7 +616,7 @@ A fresh library install will **not** have the modifications this firmware relies
 without them the build fails or the watch misbehaves (crash on BLE toggle, single-core
 rendering, no PSRAM screen cache). They are shipped as ready-to-apply unified diffs in
 [`patches/`](patches/) with an apply script for Windows and Linux — see
-[Installation → Apply the library patches](#4-apply-the-library-patches) and
+[Installation → Apply the library patches](#5-apply-the-library-patches) and
 [`patches/README.md`](patches/README.md). All are GPL-compatible:
 
 | Patch | File | Library / license | Effect |
@@ -568,29 +626,8 @@ rendering, no PSRAM screen cache). They are shipped as ready-to-apply unified di
 | Async-DMA QSPI flush | `GFX…/Arduino_ESP32QSPI.cpp` | Arduino_GFX (MIT) | overlaps pixel conversion with transmission (higher FPS) |
 | Second SPI transaction struct | `GFX…/Arduino_ESP32QSPI.h` | Arduino_GFX (MIT) | supports the pipelined flush above |
 | Unregister GAP event listener in `deinit()` | `BLE/src/BLEDevice.cpp` | ESP32 core (Apache-2.0) | fixes a crash when BLE is toggled off then on again |
-
----
-
-## Repo layout
-
-```
-ESP32-S3-WatchFace/
-  ESP32-S3-WatchFace.ino   top-level: hardware init, setup()/loop(), display flush
-  sleep_power.h            deep sleep, timed wake, AXP2101 rail probe/gating
-  notif_net.h              core-0 network task: WiFi + HTTPS notify GET + NTP
-  notif_store.h / _archive_sd.h   newest-32 NVS cache + unlimited SD/flash archive
-  ble_provision.h          BLE peripheral: secure pairing + WiFi provisioning + find-phone
-  ble_ancs.h               ANCS client: iPhone notifications over BLE
-  ble_player_ams.h         AMS client: iPhone media mirror + control
-  app_*.h                  the apps (menu, notifications, power, player, files, ...)
-  watchface.h, quick_shade.h, clocks.h, ...   the watch face + UI surfaces
-  device_info.h            product identity (name / version / vendor / board)
-  screen_cache.h           PSRAM pre-render cache (instant screen open)
-libraries/                 bundled exact-version libraries to copy into Arduino libraries/
-patches/                   library patches (.patch) + apply scripts (Win/Linux) + README
-notify-server/             the self-hosted HTTPS notification server
-WatchCompanion/            companion app
-```
+| `getPsramSize()` reports the physical chip | `cores/esp32/Esp.cpp` | ESP32 core (LGPL-2.1) | shows 8 MB instead of "6 MB" once XIP-from-PSRAM reserves heap |
+| I2S channel-leak fix in `begin()`/`end()` | `ESP_I2S/src/ESP_I2S.cpp` | ESP32 core (LGPL-2.1) | keeps the speaker alive: a failed teardown no longer leaks I2S channels until "no available channel found" |
 
 ---
 
@@ -615,8 +652,9 @@ library's license, and all are GPL-compatible).
 | `Mylibrary` (`pin_config.h`) | — | Waveshare | Waveshare board support (GPIO map) |
 
 The **ESP32 Arduino core** (Espressif Systems, v3.3.8, Apache-2.0) is installed
-separately via the Boards Manager (see [Installation](#installation)); the one patch this
-project makes to its bundled `BLE` library is in [`patches/`](patches/).
+separately via the Boards Manager (see [Installation](#installation)); the patches this
+project makes to it (the bundled `BLE` and `ESP_I2S` libraries, and `Esp.cpp`) are in
+[`patches/`](patches/).
 
 ### Hardware & references
 
@@ -630,6 +668,6 @@ project makes to its bundled `BLE` library is in [`patches/`](patches/).
 Created by **Noel Ejemyr**.
 
 > Modified-library notice (per the bundled libraries' license terms): the changes this
-> project makes to LVGL, Arduino_GFX, and the ESP32 core's BLE library are described and
-> provided as unified-diff patches in [`patches/`](patches/), each marked in-source with
-> a `LOCAL PATCH (ESP32-S3-WatchFace)` comment.
+> project makes to LVGL, Arduino_GFX, and the ESP32 core (`BLE`, `ESP_I2S`, `Esp.cpp`)
+> are described and provided as unified-diff patches in [`patches/`](patches/), each
+> marked in-source with a `LOCAL PATCH (ESP32-S3-WatchFace)` comment.

@@ -1,0 +1,51 @@
+diff --git a/src/ESP_I2S.cpp b/src/ESP_I2S.cpp
+index b87029a..68eedab 100644
+--- a/src/ESP_I2S.cpp
++++ b/src/ESP_I2S.cpp
+@@ -682,6 +682,23 @@ bool I2SClass::begin(i2s_mode_t mode, uint32_t rate, i2s_data_bit_width_t bits_c
+     log_e("Invalid I2S mode selected.");
+     return false;
+   }
++  // LOCAL PATCH (ESP32-S3-WatchFace): make begin() re-entrant. Stock code overwrites
++  // tx_chan/rx_chan with a fresh i2s_new_channel() if channels are still allocated
++  // (begin() while running, or after an end() that failed half-way), permanently
++  // leaking the old channels -- after two leaks every begin() fails with
++  // "i2s_new_channel: no available channel found" until reboot. Recycle them instead.
++  if (tx_chan != NULL) {
++    log_w("begin() with TX channel still allocated - recycling it");
++    i2s_channel_disable(tx_chan);
++    i2s_del_channel(tx_chan);
++    tx_chan = NULL;
++  }
++  if (rx_chan != NULL) {
++    log_w("begin() with RX channel still allocated - recycling it");
++    i2s_channel_disable(rx_chan);
++    i2s_del_channel(rx_chan);
++    rx_chan = NULL;
++  }
+   _mode = mode;
+ 
+   bool init = false;
+@@ -717,13 +734,20 @@ bool I2SClass::end() {
+   i2s_mode_t mode = _mode;
+   _mode = I2S_MODE_MAX;
+ 
++  // LOCAL PATCH (ESP32-S3-WatchFace): best-effort disable. If disable errors (channel
++  // already stopped, or a writer was still blocked on it), stock code returned BEFORE
++  // i2s_del_channel(), leaking the channel handle forever. Always reach the delete.
+   if (tx_chan != NULL) {
+-    I2S_ERROR_CHECK_RETURN_FALSE(i2s_channel_disable(tx_chan));
++    if (i2s_channel_disable(tx_chan) != ESP_OK) {
++      log_w("i2s_channel_disable(tx) failed - deleting the channel anyway");
++    }
+     I2S_ERROR_CHECK_RETURN_FALSE(i2s_del_channel(tx_chan));
+     tx_chan = NULL;
+   }
+   if (rx_chan != NULL) {
+-    I2S_ERROR_CHECK_RETURN_FALSE(i2s_channel_disable(rx_chan));
++    if (i2s_channel_disable(rx_chan) != ESP_OK) {
++      log_w("i2s_channel_disable(rx) failed - deleting the channel anyway");
++    }
+     I2S_ERROR_CHECK_RETURN_FALSE(i2s_del_channel(rx_chan));
+     rx_chan = NULL;
+   }

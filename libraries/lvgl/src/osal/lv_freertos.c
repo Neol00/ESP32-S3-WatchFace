@@ -90,12 +90,19 @@ lv_result_t lv_thread_init(lv_thread_t * pxThread,  const char * const name,
     pxThread->pTaskArg = xAttr;
     pxThread->pvStartRoutine = pvStartRoutine;
 
-    /* ESP32-S3-WatchFace LOCAL PATCH: pin LVGL's SW render thread to core 0.
-     * Stock LVGL uses xTaskCreate (NO_AFFINITY), so the 2nd draw unit never
-     * reliably lands on the idle core — the UI loop (pinned to core 1) stays
-     * saturated while core 0 sits idle during animation. Pinning the render
-     * thread to core 0 forces the parallel draw unit onto the free core.
+    /* ESP32-S3-WatchFace LOCAL PATCH v2: distribute LVGL's SW render threads
+     * across BOTH cores. v1 pinned every LVGL thread to core 0 — right when
+     * there was ONE draw unit (the UI loop owns core 1), but with
+     * LV_DRAW_SW_DRAW_UNIT_CNT 2 it stacked both workers on core 0, where they
+     * serialize against each other + the BT stack while core 1 idles ~50%
+     * during scrolls (seen on the [cpu] profiler). Alternate instead: 1st
+     * worker -> core 0, 2nd -> core 1. The dispatcher (loopTask, core 1) only
+     * needs CPU between draw tasks, so brief preemption by the higher-prio
+     * worker is harmless.
      * NOTE: global LVGL-library edit; re-apply after any LVGL update. */
+    static BaseType_t xNextCore = 0;
+    BaseType_t xPinCore = xNextCore;
+    xNextCore ^= 1;
     BaseType_t xTaskCreateStatus = xTaskCreatePinnedToCore(
                                        prvRunThread,
                                        name,
@@ -103,7 +110,7 @@ lv_result_t lv_thread_init(lv_thread_t * pxThread,  const char * const name,
                                        (void *)pxThread,
                                        tskIDLE_PRIORITY + xSchedPriority,
                                        &pxThread->xTaskHandle,
-                                       0);
+                                       xPinCore);
 
     /* Ensure that the FreeRTOS task was successfully created. */
     if(xTaskCreateStatus != pdPASS) {

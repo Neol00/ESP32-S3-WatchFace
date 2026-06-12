@@ -50,7 +50,6 @@ typedef struct {
 
 static pm_graph_t pm_g_batt;   // battery level (%)
 static pm_graph_t pm_g_draw;   // power draw (mA)
-static pm_graph_t pm_g_volt;   // battery voltage (mV)
 
 /* CPU usage graph: one chart, TWO series (core 0 + core 1), 0..100 %. The two
  * live values sit top-right ("c0 / c1"). */
@@ -249,10 +248,6 @@ static void pm_update_graphs(void) {
     lv_chart_set_next_value(pm_g_draw.chart, pm_g_draw.ser, ma);
     lv_label_set_text_fmt(pm_g_draw.val, "%u", ma);
   }
-  if (pm_g_volt.ser) {
-    lv_chart_set_next_value(pm_g_volt.chart, pm_g_volt.ser, vbat);
-    lv_label_set_text_fmt(pm_g_volt.val, "%u.%02u", vbat / 1000, (vbat % 1000) / 10);
-  }
 }
 
 /* Refresh the three text detail blocks (battery / power / clock). Called on open
@@ -296,10 +291,23 @@ static void pm_update_labels(void) {
   float hlc     = runtime_hours_left_capacity(pct);   // from learned/design mAh
   float real_ma = drain_avg_ma();                     // real fuel-gauge avg (0 = not yet)
   char pb[340];
-  int m = snprintf(pb, sizeof(pb),
-      "Draw:    %u mA  (model)\n"
-      "Power:   %u.%02u W  (model)",
-      ma, mw / 1000, (mw % 1000) / 10);
+  // Model lines show the gauge-learned correction factor once cycles have taught
+  // it (x1.00 until then) — "Draw: 64 mA (model x0.87)" means the raw constants
+  // overestimate by ~15% and the shown value is already corrected.
+  int m;
+  if (calib_get_k_samples() > 0) {
+    float ks = calib_awake_scale();
+    m = snprintf(pb, sizeof(pb),
+        "Draw:    %u mA  (model x%d.%02d)\n"
+        "Power:   %u.%02u W  (model)",
+        ma, (int)ks, (int)((ks - (int)ks) * 100 + 0.5f),
+        mw / 1000, (mw % 1000) / 10);
+  } else {
+    m = snprintf(pb, sizeof(pb),
+        "Draw:    %u mA  (model)\n"
+        "Power:   %u.%02u W  (model)",
+        ma, mw / 1000, (mw % 1000) / 10);
+  }
   // REAL average current from the fuel gauge — the only hardware-grounded value.
   if (m > 0 && m < (int)sizeof(pb)) {
     if (real_ma > 0.0f)
@@ -313,14 +321,17 @@ static void pm_update_labels(void) {
     m += snprintf(pb + m, sizeof(pb) - m, "\nRuntime: ~%dh %02dm", ch, cm);
   }
   // REAL deep-sleep floor current — THE number for judging the rail-cut savings.
+  // Labeled "Idle" on screen (user preference): it's the watch-at-rest draw —
+  // screen dark, CPU powered down between background checks (wake bursts are
+  // accounted as awake time and excluded from this number).
   if (m > 0 && m < (int)sizeof(pb)) {
     if (calib_is_learned())
-      snprintf(pb + m, sizeof(pb) - m, "\nSleep:   %d.%02d mA  (REAL floor, %us)",
+      snprintf(pb + m, sizeof(pb) - m, "\nIdle:    %d.%02d mA  (REAL floor, %us)",
                (int)calib_get_sleep_ma(),
                (int)((calib_get_sleep_ma() - (int)calib_get_sleep_ma()) * 100 + 0.5f),
                calib_get_samples());
     else
-      snprintf(pb + m, sizeof(pb) - m, "\nSleep:   learning floor...");
+      snprintf(pb + m, sizeof(pb) - m, "\nIdle:    learning floor...");
   }
   lv_label_set_text(pm_power_lbl, pb);
 
@@ -344,6 +355,31 @@ static void pm_update_labels(void) {
     else                   k += snprintf(cb + k, sizeof(cb) - k, "\nOC:      stock (tap below)");
   }
 #endif
+
+  // --- Temperatures: the two real die sensors on this board ---
+  // SoC = the S3's internal sensor (the number to watch while undervolting /
+  // overclocking — silicon margin shrinks as it warms). PMU = AXP2101 die temp,
+  // a proxy for charge-path / regulator heat. The battery NTC (TS pin) isn't
+  // populated on this board, so these two ARE the available set. The PMU's Tdie
+  // ADC channel is enabled lazily on first read (µA-scale; shared-ADC mux).
+  if (k > 0 && k < (int)sizeof(cb)) {
+    float soc_c = temperatureRead();           // built-in S3 die sensor (degC)
+    float pmu_c = -273.0f;
+    if (pmu_ok) {
+      static bool s_tdie_en = false;
+      i2c_lock();                              // shared bus (core 1 UI vs core 0 net)
+      if (!s_tdie_en) { power.enableTemperatureMeasure(); s_tdie_en = true; }
+      pmu_c = power.getTemperature();
+      i2c_unlock();
+    }
+    if (pmu_c > -100.0f)
+      k += snprintf(cb + k, sizeof(cb) - k, "\nTemp:    SoC %d.%uC  PMU %d.%uC",
+                    (int)soc_c, (unsigned)((soc_c - (int)soc_c) * 10) % 10,
+                    (int)pmu_c, (unsigned)((pmu_c - (int)pmu_c) * 10) % 10);
+    else
+      k += snprintf(cb + k, sizeof(cb) - k, "\nTemp:    SoC %d.%uC",
+                    (int)soc_c, (unsigned)((soc_c - (int)soc_c) * 10) % 10);
+  }
   lv_label_set_text(pm_clk_lbl, cb);
 }
 
@@ -369,7 +405,6 @@ static void pm_cleanup_cb(lv_event_t *e) {
   pm_clk_lbl  = nullptr;
   pm_g_batt = pm_graph_t{};
   pm_g_draw = pm_graph_t{};
-  pm_g_volt = pm_graph_t{};
   pm_g_cpu  = pm_cpu_graph_t{};
   pm_wake_sw  = nullptr;
   pm_intv_lbl = nullptr;
@@ -544,10 +579,6 @@ static void app_open_power(void) {
   pm_header(col, "POWER");
   pm_make_graph(col, "Draw  (model mA)", 0, 400, &pm_g_draw);
   pm_power_lbl = pm_line(col, &FONT_SMALL, PM_VAL, "");
-
-  // ---- VOLTAGE ----
-  pm_header(col, "VOLTAGE");
-  pm_make_graph(col, "Battery  (V)", 3000, 4300, &pm_g_volt);
 
   // ---- CPU (per-core usage) ----
   pm_header(col, "CPU  (per-core %)");

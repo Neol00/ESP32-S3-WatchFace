@@ -40,6 +40,7 @@
 #include <Arduino.h>
 #include <FS.h>
 #include <FFat.h>
+#include "esp_heap_caps.h"   // heap_caps_malloc — view/line buffers live in PSRAM
 #include "sd_card.h"
 #include "storage_fs.h"
 
@@ -81,11 +82,24 @@ struct NaViewItem {
   char     preview[NA_PREVIEW];   // sanitized first chars of the body, for the row
 };
 
-static NaViewItem s_na_view[NA_VIEW_MAX];
+/* Both working buffers live in PSRAM, not static SRAM (~20 KB of .bss freed for
+ * the display's partial render buffers). Allocated on first file operation via
+ * na_bufs_ok(); s_na_view reads elsewhere are guarded by s_na_view_count, which
+ * only becomes non-zero after a successful alloc. */
+static NaViewItem *s_na_view = nullptr;  // [NA_VIEW_MAX]
 static uint16_t   s_na_view_count = 0;   // entries in s_na_view (newest-first)
 static uint32_t   s_na_total      = 0;   // total records in the archive file
 static uint32_t   s_na_unread     = 0;   // records with read==0 (bell badge count)
-static char       s_na_line[NA_LINE_MAX];  // shared line buffer (single-threaded under store_lock)
+static char       *s_na_line = nullptr;  // [NA_LINE_MAX] shared line buffer (single-threaded under store_lock)
+
+static bool na_bufs_ok(void) {
+  if (!s_na_view)
+    s_na_view = (NaViewItem *)heap_caps_calloc(NA_VIEW_MAX, sizeof(NaViewItem),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!s_na_line)
+    s_na_line = (char *)heap_caps_malloc(NA_LINE_MAX, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return s_na_view && s_na_line;
+}
 
 /* Is the archive usable right now? True if EITHER the SD card is mounted OR the
  * on-flash FAT partition mounts. SD is preferred; FFat is the no-card fallback. */
@@ -183,6 +197,7 @@ static bool na_parse_line(int len, uint64_t *id, bool *read, uint8_t *cat,
  * or -1 at end of file. The caller MUST have done f.setTimeout(0) first, else
  * readBytesUntil busy-waits a full second at EOF (Stream's default timeout). */
 static int na_read_line(File &f) {
+  if (!na_bufs_ok()) return -1;   // alloc failed -> behave like an empty file
   size_t n = f.readBytesUntil('\n', s_na_line, NA_LINE_MAX - 1);
   if (n == 0 && !f.available()) return -1;
   // Strip a trailing CR if the file ever has CRLF line endings.

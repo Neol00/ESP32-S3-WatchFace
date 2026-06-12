@@ -22,6 +22,7 @@ ESP32_CORE_DIR="${2:-$HOME/.arduino15/packages/esp32/hardware/esp32/3.3.8}"
 LVGL_DIR="$LIBRARIES_DIR/lvgl"
 GFX_DIR="$LIBRARIES_DIR/GFX_Library_for_Arduino"
 BLE_DIR="$ESP32_CORE_DIR/libraries/BLE"
+I2S_DIR="$ESP32_CORE_DIR/libraries/ESP_I2S"
 
 command -v patch >/dev/null 2>&1 || { echo "ERROR: 'patch' not found. Install it (e.g. apt install patch)."; exit 1; }
 
@@ -32,9 +33,11 @@ JOBS=(
   "03-gfx-qspi-dma.patch|$GFX_DIR|GFX QSPI async-DMA flush"
   "04-gfx-qspi-header.patch|$GFX_DIR|GFX QSPI second transaction struct"
   "05-esp32-ble-gap.patch|$BLE_DIR|ESP32 core BLE GAP-listener unregister"
+  "06-esp32-psram-size.patch|$ESP32_CORE_DIR|ESP32 core getPsramSize physical chip size"
+  "08-esp32-i2s-channel-leak.patch|$I2S_DIR|ESP32 core ESP_I2S channel-leak fix"
 )
 
-for d in "$LVGL_DIR" "$LIBRARIES_DIR" "$GFX_DIR" "$BLE_DIR"; do
+for d in "$LVGL_DIR" "$LIBRARIES_DIR" "$GFX_DIR" "$BLE_DIR" "$I2S_DIR"; do
   [ -d "$d" ] || { echo "ERROR: target directory not found: $d"; echo "Check the LIBRARIES_DIR / ESP32_CORE_DIR arguments."; exit 1; }
 done
 

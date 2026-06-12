@@ -137,6 +137,21 @@ static uint16_t s_ds_len = 0;
  * ancs_request_attrs, read in ancs_parse_and_store to decide store vs. live-call. */
 static uint8_t s_inflight_cat = ANCS_CAT_OTHER;
 
+/* ---- pending attribute-request queue ----
+ * iOS replays the whole notification backlog as ONE burst of ADDED events right
+ * after the NS subscribe. Firing a Control Point write per event as it arrives
+ * exhausts NimBLE's few per-connection GATT procedure slots — every write past the
+ * first few fails rc=6 (BLE_HS_ENOMEM) and those notifications are silently LOST.
+ * So ADDED events are queued here and pumped strictly one-in-flight: the next
+ * request goes out when the previous reply has been fully parsed. */
+#define ANCS_REQQ_MAX 32
+static uint32_t s_reqq_uid[ANCS_REQQ_MAX];
+static uint8_t  s_reqq_cat[ANCS_REQQ_MAX];
+static uint8_t  s_reqq_head = 0, s_reqq_count = 0;   // ring (head = next to send)
+static bool     s_req_inflight   = false;
+static uint32_t s_req_started_ms = 0;                // stale-reply watchdog
+static void ancs_req_complete(void);                 // defined after the pump
+
 /* ---- content fingerprint (durable de-dup key) ----
  * FNV-1a 32-bit hash of app + '\x1f' + date + '\x1f' + title. Stable for a given
  * notification across reconnects/power-off (unlike the ANCS UID), so the same item
@@ -207,6 +222,8 @@ static void ancs_reset(void) {
   s_ancs_ns_subbed = false; s_ancs_ds_subbed = false;
   s_ds_len = 0;
   s_uidmap_head = 0; s_uidmap_count = 0;   // UIDs are per-connection
+  s_reqq_head = 0; s_reqq_count = 0;       // ...and so are queued attribute requests
+  s_req_inflight = false;
   // A ringing call can't survive a disconnect; drop any live incoming-call state so a
   // reconnect doesn't show a stale "incoming call".
   if (s_incoming_active) { s_incoming_active = false; s_incoming_uid = 0; s_incoming_dirty = true; }
@@ -219,7 +236,11 @@ static void ancs_reset(void) {
  *   [CommandID=0][UID:4 LE][ {AttrID:1}{Len:2 LE}{Data:Len} ... ]
  * Runs on the NimBLE task -> guards the store, never touches LVGL. */
 static void ancs_parse_and_store(void) {
-  if (s_ds_len < 5 || s_ds_buf[0] != ANCS_CMD_GET_NOTIF_ATTRS) { s_ds_len = 0; return; }
+  if (s_ds_len < 5 || s_ds_buf[0] != ANCS_CMD_GET_NOTIF_ATTRS) {
+    s_ds_len = 0;
+    ancs_req_complete();           // malformed reply still frees the request slot
+    return;
+  }
   uint32_t uid = (uint32_t)s_ds_buf[1] | ((uint32_t)s_ds_buf[2] << 8) |
                  ((uint32_t)s_ds_buf[3] << 16) | ((uint32_t)s_ds_buf[4] << 24);
 
@@ -267,7 +288,11 @@ static void ancs_parse_and_store(void) {
     strncpy(title, app, NOTIF_TITLE_MAX - 1);
     title[NOTIF_TITLE_MAX - 1] = '\0';
   }
-  if (title[0] == '\0' && body[0] == '\0') { s_ds_len = 0; return; }  // nothing usable
+  if (title[0] == '\0' && body[0] == '\0') {                          // nothing usable
+    s_ds_len = 0;
+    ancs_req_complete();
+    return;
+  }
 
   // INCOMING CALL: transient — do NOT write it to the notification store (that's what
   // caused the duplicate: the incoming call lingered next to the later missed call).
@@ -285,6 +310,7 @@ static void ancs_parse_and_store(void) {
     USBSerial.printf("[ancs] incoming call from \"%s\" (uid=%lu) — transient, not stored\n",
                      s_incoming_who, (unsigned long)uid);
     s_ds_len = 0;
+    ancs_req_complete();
     return;
   }
 
@@ -328,6 +354,7 @@ static void ancs_parse_and_store(void) {
     USBSerial.printf("[ancs] dup (already stored) fp=%08lX app=\"%s\" title=\"%s\"\n",
                      (unsigned long)fp, app, title);
   s_ds_len = 0;                    // ready for the next reply
+  ancs_req_complete();             // reply done -> send the next queued request
 }
 
 /* Data Source notify RX: append bytes to the reassembly buffer, then try to parse.
@@ -335,7 +362,11 @@ static void ancs_parse_and_store(void) {
  * a single growing record is correct: each new request resets it (see ancs_request). */
 static void ancs_data_source_rx(const uint8_t *data, uint16_t len) {
   if (len == 0) return;
-  if (s_ds_len + len > ANCS_DS_BUF_MAX) { s_ds_len = 0; return; }  // overflow guard -> drop
+  if (s_ds_len + len > ANCS_DS_BUF_MAX) {                  // overflow guard -> drop the
+    s_ds_len = 0;                                          // reply, free the slot
+    ancs_req_complete();
+    return;
+  }
   memcpy(&s_ds_buf[s_ds_len], data, len);
   s_ds_len += len;
   ancs_parse_and_store();          // no-op until a full record is present
@@ -347,8 +378,8 @@ static void ancs_data_source_rx(const uint8_t *data, uint16_t len) {
  * Request layout: [CmdID=0][UID:4 LE][AttrID][maxlen:2 LE]... (AppID/Date: no maxlen).
  * Date (attr 5) is a FIXED 16-char "yyyyMMdd'T'HHmmSS" string — its stable value is
  * the backbone of our cross-reconnect dedup fingerprint (the UID isn't durable). */
-static void ancs_request_attrs(uint32_t uid, uint8_t ancs_cat) {
-  if (!s_ancs_cp_val) return;
+static bool ancs_request_attrs(uint32_t uid, uint8_t ancs_cat) {
+  if (!s_ancs_cp_val) return false;
   s_inflight_cat = ancs_cat;       // remember the category for ancs_parse_and_store
   uint8_t req[32];
   uint16_t n = 0;
@@ -369,6 +400,43 @@ static void ancs_request_attrs(uint32_t uid, uint8_t ancs_cat) {
   s_ds_len = 0;                    // start a fresh reassembly for this reply
   int rc = ble_gattc_write_flat(s_ancs_conn, s_ancs_cp_val, req, n, NULL, NULL);
   if (rc != 0) USBSerial.printf("[ancs] control-point write rc=%d (uid=%lu)\n", rc, (unsigned long)uid);
+  return rc == 0;
+}
+
+/* Send the next queued attribute request, strictly one in flight. A request whose
+ * write kickoff fails is dropped and the next one tried (bounded by the queue). */
+static void ancs_req_pump(void) {
+  while (!s_req_inflight && s_reqq_count && s_ancs_cp_val) {
+    uint32_t uid = s_reqq_uid[s_reqq_head];
+    uint8_t  cat = s_reqq_cat[s_reqq_head];
+    s_reqq_head  = (s_reqq_head + 1) % ANCS_REQQ_MAX;
+    s_reqq_count--;
+    if (ancs_request_attrs(uid, cat)) {
+      s_req_inflight   = true;
+      s_req_started_ms = millis();
+    }
+  }
+}
+
+/* The in-flight reply is fully consumed (or unusable): free the slot, send the next. */
+static void ancs_req_complete(void) {
+  s_req_inflight = false;
+  ancs_req_pump();
+}
+
+/* Queue an ADDED/MODIFIED event's attribute fetch. If a reply went missing (iOS
+ * never finished it), don't let the stale in-flight flag wedge the queue forever. */
+static void ancs_req_enqueue(uint32_t uid, uint8_t cat) {
+  if (s_req_inflight && millis() - s_req_started_ms > 3000) s_req_inflight = false;
+  if (s_reqq_count >= ANCS_REQQ_MAX) {
+    USBSerial.printf("[ancs] request queue full — dropping uid=%lu\n", (unsigned long)uid);
+    return;
+  }
+  uint8_t tail = (s_reqq_head + s_reqq_count) % ANCS_REQQ_MAX;
+  s_reqq_uid[tail] = uid;
+  s_reqq_cat[tail] = cat;
+  s_reqq_count++;
+  ancs_req_pump();
 }
 
 /* ===================== Notification Source RX ============================= */
@@ -418,9 +486,10 @@ static void ancs_notif_source_rx(const uint8_t *data, uint16_t len) {
     return;
   }
 
-  // ADDED or MODIFIED: fetch attributes. We pass the category through so the parser
-  // can route an INCOMING_CALL to the transient live-call state instead of the store.
-  ancs_request_attrs(uid, category);
+  // ADDED or MODIFIED: queue the attribute fetch (serialized — see ancs_req_pump).
+  // The category rides along so the parser can route an INCOMING_CALL to the
+  // transient live-call state instead of the store.
+  ancs_req_enqueue(uid, category);
 }
 
 /* ===================== subscribe (write CCCDs) ============================ */

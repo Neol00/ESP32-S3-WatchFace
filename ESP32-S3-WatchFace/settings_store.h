@@ -245,6 +245,65 @@ static void settings_set_ble_enabled(bool en) {
   // the future provisioning code can honor it. No radio is started here.
 }
 
+/* ---- Radio TX power (router-style range knob) ----
+ * Lower TX power = lower current during every radio burst (WiFi TX peaks ~300 mA
+ * at full power, well under half that at the low tiers) at the cost of range. A
+ * small apartment is fine on the low tiers; Max = stock behavior. Five shared
+ * tiers, persisted as an index.
+ *
+ * Apply points (the drivers reset power on init, so set-and-forget won't stick):
+ *   - WiFi: settings_apply_wifi_txp() after every successful connect
+ *     (wifi_connect in notif_net.h) — esp_wifi_set_max_tx_power needs the driver
+ *     STARTED, and each fetch restarts it.
+ *   - BLE:  settings_apply_ble_txp() right after BLEDevice::init() (ble_begin),
+ *     gated on the controller actually being up so a stray call can't fault. */
+#include <esp_wifi.h>   // esp_wifi_set_max_tx_power
+#include <esp_bt.h>     // esp_ble_tx_power_set / esp_bt_controller_get_status
+
+#define RADIO_TXP_COUNT 7
+static const char  *RADIO_TXP_NAMES[RADIO_TXP_COUNT] = { "Min", "VLow", "Low", "Mid", "High", "VHigh", "Max" };
+static const int8_t WIFI_TXP_QDBM[RADIO_TXP_COUNT]   = { 8, 20, 28, 44, 60, 72, 80 };  // 0.25 dBm units
+static const int8_t WIFI_TXP_DBM[RADIO_TXP_COUNT]    = { 2, 5, 7, 11, 15, 18, 20 };    // UI labels
+/* BLE ladder spread low on purpose: the phone is on the same body, not across the
+ * room. Min = the S3 controller's hardware floor (-24 dBm) — works desk-distance,
+ * can get marginal wrist-to-pocket THROUGH the body (link shows as lag/reconnects,
+ * not silence; just cycle up a tier). Low (-12) is the safe everyday low; VHigh (+9)
+ * is the old stock maximum; Max (+20) is the controller's ceiling for long range at
+ * a real battery cost. WiFi has no headroom in either direction: its Min (8 quarter-
+ * dBm = 2 dBm) and Max (80 = 20 dBm) are already the API floor and ceiling. */
+static const esp_power_level_t BLE_TXP_LVL[RADIO_TXP_COUNT] = {
+  ESP_PWR_LVL_N24, ESP_PWR_LVL_N18, ESP_PWR_LVL_N12, ESP_PWR_LVL_N6,
+  ESP_PWR_LVL_N0,  ESP_PWR_LVL_P9,  ESP_PWR_LVL_P20 };
+static const int8_t BLE_TXP_DBM[RADIO_TXP_COUNT]     = { -24, -18, -12, -6, 0, 9, 20 };
+
+static uint8_t s_wifi_txp = RADIO_TXP_COUNT - 1;   // default Max = stock (20 dBm)
+static uint8_t s_ble_txp  = RADIO_TXP_COUNT - 2;   // default VHigh = stock (+9); Max
+                                                   // (+20) is opt-in, it costs real mA
+
+static void settings_apply_wifi_txp(void) {
+  // No-op (harmless error) unless the WiFi driver is started; called after each
+  // connect so the setting survives the driver's off/on cycles between fetches.
+  esp_wifi_set_max_tx_power(WIFI_TXP_QDBM[s_wifi_txp]);
+}
+static void settings_apply_ble_txp(void) {
+  if (esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED) return;
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, BLE_TXP_LVL[s_ble_txp]);  // connections
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,     BLE_TXP_LVL[s_ble_txp]);  // advertising
+}
+
+static uint8_t settings_get_wifi_txp(void) { return s_wifi_txp; }
+static void settings_set_wifi_txp(uint8_t idx) {
+  s_wifi_txp = idx % RADIO_TXP_COUNT;
+  prefs.putUChar("wifitxp", s_wifi_txp);
+  settings_apply_wifi_txp();               // live if the radio happens to be up
+}
+static uint8_t settings_get_ble_txp(void) { return s_ble_txp; }
+static void settings_set_ble_txp(uint8_t idx) {
+  s_ble_txp = idx % RADIO_TXP_COUNT;
+  prefs.putUChar("bletxp", s_ble_txp);
+  settings_apply_ble_txp();                // live if the controller is up
+}
+
 /* CPU frequency (MHz) while AWAKE. Lower = less power on the watch face; deep
  * sleep is unaffected (CPU powers down regardless). Only specific S3 values are
  * valid AND WiFi-capable: 240/160/80. setCpuFrequencyMhz() applies it. */
@@ -344,6 +403,8 @@ static void settings_load(void) {
   s_cpu_mhz           = prefs.getUShort("cpumhz",   s_cpu_mhz);
   s_wifi_enabled      = prefs.getBool  ("wifien",   s_wifi_enabled);
   s_ble_enabled       = prefs.getBool  ("bleen",    s_ble_enabled);
+  s_wifi_txp          = prefs.getUChar ("wifitxp",  s_wifi_txp) % RADIO_TXP_COUNT;
+  s_ble_txp           = prefs.getUChar ("bletxp",   s_ble_txp)  % RADIO_TXP_COUNT;
   s_autodim_on        = prefs.getBool  ("autodim",  s_autodim_on);
   s_autodim_pct       = prefs.getUChar ("autodimp", s_autodim_pct);
   s_dim_on_usb        = prefs.getBool  ("dimusb",   s_dim_on_usb);

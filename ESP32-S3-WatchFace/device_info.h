@@ -10,10 +10,10 @@
 #pragma once
 #include <Arduino.h>
 
-#define DEVICE_NAME    "ESP32-S3-WatchFace"   // full product name (repo/splash/About)
+#define DEVICE_NAME    "ESP32-S3-WatchFace"   // full product name
 #define DEVICE_SHORT   "WatchFace"            // short form for radio names
-#define DEVICE_VERSION "1.0.0"                // firmware version (bump on release)
-#define DEVICE_AUTHOR  "Noel Ejemyr"          // project author (shown in About)
+#define DEVICE_VERSION "1.1.0"                // firmware version
+#define DEVICE_AUTHOR  "Noel Ejemyr"          // project author
 #define DEVICE_VENDOR  "Waveshare"            // hardware vendor
 #define DEVICE_BOARD   "ESP32-S3-Touch-AMOLED-2.06"  // board model
 

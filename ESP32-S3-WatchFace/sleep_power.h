@@ -300,16 +300,25 @@ static void arm_wakes_and_sleep(void) {
   // (EXT0) wake armed below — it never wakes on its own, so no battery is spent on
   // background fetches; you bring it back with a BOOT press. A RUNNING countdown
   // still arms a timer wake regardless, so the alarm always fires on time.
-  bool timer_due_wake = timer_is_active() && !timer_is_paused();
-  if (s_checks_enabled || timer_due_wake) {
-    uint64_t us = (uint64_t)s_check_interval_min * 60ULL * 1000000ULL;
-    // If a countdown is running, wake exactly when it's due (if that's sooner than
-    // the next notification check) so the alarm fires on time instead of up to a
-    // full interval late. Floor at 1s so we never busy-wake.
+  bool     timer_due_wake = timer_is_active() && !timer_is_paused();
+  uint32_t almc_in        = almclk_seconds_until();   // 0 = no alarm clock armed
+  if (s_checks_enabled || timer_due_wake || almc_in) {
+    // Wake at the SOONEST deadline: the next notification check (only if checks
+    // are on), a running countdown's due time, the alarm clock's fire time.
+    // (Previously a running countdown with checks OFF woke at the check interval
+    // anyway; now it sleeps straight through to its due time.)
+    uint64_t us = UINT64_MAX;
+    if (s_checks_enabled)
+      us = (uint64_t)s_check_interval_min * 60ULL * 1000000ULL;
     if (timer_due_wake) {
       uint64_t tus = (uint64_t)timer_remaining_s() * 1000000ULL;
-      if (tus < us) us = (tus < 1000000ULL) ? 1000000ULL : tus;
+      if (tus < us) us = tus;
     }
+    if (almc_in) {
+      uint64_t aus = (uint64_t)almc_in * 1000000ULL;
+      if (aus < us) us = aus;
+    }
+    if (us < 1000000ULL) us = 1000000ULL;   // floor at 1s so we never busy-wake
     esp_sleep_enable_timer_wakeup(us);
   }
 
@@ -321,6 +330,7 @@ static void arm_wakes_and_sleep(void) {
   esp_sleep_enable_ext0_wakeup((gpio_num_t)BOOT_BTN_GPIO, 0); // wake on LOW (press)
 
   haptics_prepare_sleep();                 // latch motor LOW so it can't float-buzz
+  audio_alarm_prepare_sleep();             // latch the codec/amp rail (GPIO46) OFF too
   rails_cut_for_sleep();                    // cut the proven-safe peripheral rails, last
 
   esp_deep_sleep_start();                  // does not return

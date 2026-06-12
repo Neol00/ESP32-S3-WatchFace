@@ -52,6 +52,11 @@ static lv_obj_t *tmr_btn(lv_obj_t *parent, const char *txt, lv_event_cb_t cb,
 static lv_obj_t *alarm_scr = nullptr;   // full-screen modal overlay (null = not ringing)
 static bool      s_alarm_from_timer = false;  // true = a timer fired it (dismiss cancels the timer);
                                               // false = an external ring (e.g. Find My Watch)
+static bool      s_alarm_from_clock = false;  // true = the alarm CLOCK fired it (its state was
+                                              // already advanced at fire time; dismiss only
+                                              // refreshes the Alarm screen if it's open)
+static void app_open_alarmclock(void);        // fwd: the Alarm list screen (defined below)
+static void app_open_alarmedit(void);         // fwd: the single-alarm editor (defined below)
 
 /* The watch only pushes its RAM framebuffer to the panel when the loop sees
  * something "dirty" (DIRECT_RENDER_MODE). g_alarm_active forces a push every loop
@@ -60,24 +65,35 @@ static bool      s_alarm_from_timer = false;  // true = a timer fired it (dismis
 static bool s_alarm_dirty = false;
 static inline bool alarm_take_dirty(void) { bool d = s_alarm_dirty; s_alarm_dirty = false; return d; }
 
-/* ---- SOUND HOOK (stub) ----
- * The board has an audio codec; wiring a real tone is a later job. For now these
- * are the single place to add it — alarm_fire() starts it, dismiss stops it. */
+/* ---- SOUND HOOK ----
+ * Synthesized bell chime through the ES8311 codec (audio_alarm.h) —
+ * alarm_fire() starts it, dismiss stops it. */
 static void alarm_sound_start(void) {
   if (settings_get_mute()) return;     // muted -> vibration only, no tone
-  /* TODO: start alarm tone via codec/buzzer */
+  audio_alarm_start();
 }
-static void alarm_sound_stop(void)  { /* TODO: stop alarm tone */ }
+static void alarm_sound_stop(void)  { audio_alarm_stop(); }
 
 static void alarm_dismiss(void) {
   if (!g_alarm_active) return;
   haptics_stop();
   alarm_sound_stop();
-  if (s_alarm_from_timer) timer_cancel();   // only a fired TIMER is "done"; an
+  bool fired_timer = s_alarm_from_timer;
+  if (fired_timer) timer_cancel();          // only a fired TIMER is "done"; an
                                             // external ring (Find My Watch) has none
   g_alarm_active = false;
   s_alarm_dirty = true;                 // push one more frame to clear the overlay
   if (alarm_scr) { lv_obj_del(alarm_scr); alarm_scr = nullptr; }
+  // If the Timer app is the screen under the overlay, it was built in RUN mode
+  // (Pause/Cancel) for a countdown that no longer exists — rebuild it into set
+  // mode, same as the Cancel button does.
+  if (fired_timer && nav_current == app_open_timer) app_open_timer();
+  // Same idea for the Alarm screens (list or editor): a fired one-shot switched
+  // itself off, a repeat re-armed — rebuild so toggles + hints show the truth.
+  if (s_alarm_from_clock &&
+      (nav_current == app_open_alarmclock || nav_current == app_open_alarmedit))
+    nav_current();
+  s_alarm_from_clock = false;
 }
 
 static void alarm_click_cb(lv_event_t *e) {
@@ -92,6 +108,7 @@ static void alarm_fire_ex(const char *title, const char *subtitle, bool fromTime
   if (g_alarm_active) return;
   g_alarm_active = true;
   s_alarm_from_timer = fromTimer;
+  s_alarm_from_clock = false;            // almclk_fire() re-sets this after the call
   s_alarm_dirty = true;
   haptics_play(HAPTICS_HEARTBEAT, true);
   alarm_sound_start();
@@ -137,6 +154,23 @@ static void alarm_fire(void) {
   char b[24]; tmr_fmt(timer_duration_s(), b, sizeof b);
   char sub[40]; snprintf(sub, sizeof sub, "Timer  %s", b);
   alarm_fire_ex("Time's up!", sub, true);
+}
+
+/* Alarm-clock ring. State advances BEFORE the overlay goes up (a one-shot turns
+ * itself off, a repeat re-arms for the next selected day), so even a crash or
+ * battery death mid-ring can't make it fire again on the next boot. If several
+ * alarms are due at once, the earliest rings now and the loop rings the rest
+ * one by one as each overlay is dismissed. */
+static void almclk_fire(void) {
+  if (g_alarm_active) return;
+  int i = almclk_due_index();
+  if (i < 0) { almclk_rearm(); return; }   // stale NVS master (e.g. the CSV was
+                                           // edited on a PC) — self-heal and move on
+  uint8_t h = s_almcs[i].h, m = s_almcs[i].m;
+  almclk_fired(i);
+  char sub[24]; snprintf(sub, sizeof sub, "Alarm  %02u:%02u", h, m);
+  alarm_fire_ex("Wake up!", sub, false);   // not a countdown: dismiss cancels nothing
+  s_alarm_from_clock = true;
 }
 
 /* ============================== Timer UI ================================= */
@@ -261,7 +295,8 @@ static void tmr_cancel_cb(lv_event_t *e) {
   timer_cancel();
   app_open_timer();                      // rebuild into set mode
 }
-static void tmr_open_sw_cb(lv_event_t *e) { (void)e; nav_open(app_open_stopwatch); }
+static void tmr_open_sw_cb(lv_event_t *e)   { (void)e; nav_open(app_open_stopwatch); }
+static void tmr_open_almc_cb(lv_event_t *e) { (void)e; nav_open(app_open_alarmclock); }
 static void tmr_touch_cb(lv_event_t *e) {
   lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
   alarm_set_touch_dismiss(lv_obj_has_state(sw, LV_STATE_CHECKED));
@@ -303,19 +338,6 @@ static lv_obj_t *tmr_row(lv_obj_t *col) {
                         LV_FLEX_ALIGN_CENTER);
   lv_obj_set_style_pad_column(r, 8, 0);
   return r;
-}
-
-static void tmr_add_warning(lv_obj_t *col) {
-  lv_obj_t *w = lv_label_create(col);
-  lv_obj_set_style_text_font(w, &FONT_SMALL, 0);
-  lv_obj_set_style_text_color(w, lv_color_hex(0xC9A227), 0);   // amber
-  lv_obj_set_width(w, LV_PCT(100));
-  lv_label_set_long_mode(w, LV_LABEL_LONG_WRAP);
-  lv_label_set_text(w, LV_SYMBOL_WARNING
-      "  The watch sleeps to save power. If background checks are off, "
-      "then the timer will not wake the watch. for to-the-second timing, use Caffeine "
-      "mode (Pull down menu, The coffee icon).");
-  lv_obj_set_style_pad_top(w, 6, 0);
 }
 
 static void app_open_timer(void) {
@@ -384,10 +406,10 @@ static void app_open_timer(void) {
   if (alarm_touch_dismiss()) lv_obj_add_state(sw, LV_STATE_CHECKED);
   lv_obj_add_event_cb(sw, tmr_touch_cb, LV_EVENT_VALUE_CHANGED, nullptr);
 
-  tmr_add_warning(col);
-
-  // Jump to the stopwatch.
-  tmr_btn(col, LV_SYMBOL_LOOP "  Stopwatch", tmr_open_sw_cb, nullptr, 0x1F1F1F, 220);
+  // Jump to the stopwatch / alarm clock.
+  lv_obj_t *jr = tmr_row(col);
+  tmr_btn(jr, LV_SYMBOL_LOOP "  Stopwatch", tmr_open_sw_cb, nullptr, 0x1F1F1F, 168);
+  tmr_btn(jr, LV_SYMBOL_BELL "  Alarm", tmr_open_almc_cb, nullptr, 0x1F1F1F, 130);
 
   tmr_refresh();
   tmr_lv_tmr = lv_timer_create(tmr_lv_cb, 500, nullptr);
@@ -508,4 +530,325 @@ static void app_open_stopwatch(void) {
   sw_refresh();
   sw_lv_tmr = lv_timer_create(sw_lv_cb, 50, nullptr);   // smooth centiseconds
   lv_obj_add_event_cb(app_scr, sw_cleanup_cb, LV_EVENT_DELETE, nullptr);
+}
+
+/* =========================== Alarm clock UI ===============================
+ * TWO screens. app_open_alarmclock = the LIST: one row per alarm (time, days
+ * summary, on/off switch), tap a row to edit, "+ Add alarm" appends. The list
+ * itself lives in /alarms.csv — see timer_store.h. app_open_alarmedit = the
+ * EDITOR for s_almc_edit: HH:MM steppers, repeat + weekday picks, Delete.
+ * Ringing reuses the countdown's overlay/chime via almclk_fire(). */
+
+static int       s_almc_edit   = -1;       // index being edited (editor screen)
+static lv_obj_t *almc_time_lbl = nullptr;  // editor: big HH:MM
+static lv_obj_t *almc_next_lbl = nullptr;  // editor/list: "rings in" hint
+
+/* The alarm under edit, or null if the index went stale. */
+static AlmClk *almc_ed(void) {
+  return (s_almc_edit >= 0 && s_almc_edit < s_almc_n) ? &s_almcs[s_almc_edit]
+                                                      : nullptr;
+}
+
+/* "Once" / "Every day" / "Mon-Fri" / "Mo We Fr" — the list row's summary. */
+static void almc_days_str(const AlmClk *a, char *buf, size_t n) {
+  if (!a->rep)          { strlcpy(buf, "Once", n);      return; }
+  if (a->days == 0x7F)  { strlcpy(buf, "Every day", n); return; }
+  if (a->days == 0x1F)  { strlcpy(buf, "Mon-Fri", n);   return; }
+  if (a->days == 0)     { strlcpy(buf, "No days", n);   return; }
+  static const char *DN[7] = { "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" };
+  buf[0] = '\0';
+  for (int d = 0; d < 7; d++)
+    if (a->days & (1 << d)) { strlcat(buf, DN[d], n); strlcat(buf, " ", n); }
+}
+
+static void almc_fmt_in(char *buf, size_t n, uint32_t target) {
+  uint32_t now = rtc_now_epoch();
+  uint32_t in  = (target > now) ? target - now : 0;
+  uint32_t h = in / 3600, m = (in % 3600) / 60;
+  if (h) snprintf(buf, n, "Rings in %luh %02lum", (unsigned long)h, (unsigned long)m);
+  else   snprintf(buf, n, "Rings in %lum", (unsigned long)(m ? m : 1));
+}
+
+/* Editor refresh: the big HH:MM + this alarm's own "rings in" hint. */
+static void almc_refresh(void) {
+  AlmClk *a = almc_ed();
+  if (!almc_time_lbl || !a) return;
+  lv_label_set_text_fmt(almc_time_lbl, "%02u:%02u", a->h, a->m);
+  if (!almc_next_lbl) return;
+  if (!a->en)         { lv_label_set_text(almc_next_lbl, "Alarm off"); return; }
+  if (!a->target)     { lv_label_set_text(almc_next_lbl, "No repeat days selected"); return; }
+  char b[40]; almc_fmt_in(b, sizeof b, a->target);
+  lv_label_set_text(almc_next_lbl, b);
+}
+
+/* List-screen hint: the soonest ring across ALL alarms. */
+static void almc_list_hint(void) {
+  if (!almc_next_lbl) return;
+  uint32_t in = almclk_seconds_until();
+  if (s_almc_n == 0)  { lv_label_set_text(almc_next_lbl, "No alarms yet"); return; }
+  if (in == 0)        { lv_label_set_text(almc_next_lbl, "All alarms off"); return; }
+  char b[40]; almc_fmt_in(b, sizeof b, s_almc_master);
+  lv_label_set_text(almc_next_lbl, b);
+}
+
+/* Tap or hold-repeat a +/- pill: shift HH:MM by the step (minutes), wrapping
+ * around the day. NVS is only written on release (almc_commit_cb), so a held
+ * repeat doesn't hammer flash. */
+static void almc_step_cb(lv_event_t *e) {
+  AlmClk *a = almc_ed();
+  if (!a) return;
+  int32_t d = (int32_t)(intptr_t)lv_event_get_user_data(e);
+  int32_t mins = (int32_t)a->h * 60 + a->m + d;
+  mins %= 1440; if (mins < 0) mins += 1440;
+  a->h = (uint8_t)(mins / 60);
+  a->m = (uint8_t)(mins % 60);
+  haptics_pulse(8);
+  almc_refresh();
+}
+static void almc_commit_cb(lv_event_t *e) {
+  (void)e;
+  almclk_save_csv();
+  almclk_rearm();
+  almc_refresh();           // "rings in" needs the re-armed target
+}
+static lv_obj_t *almc_step_btn(lv_obj_t *parent, const char *txt, int32_t step_min) {
+  lv_obj_t *b = lv_btn_create(parent);
+  lv_obj_set_size(b, 80, 52);
+  lv_obj_set_style_radius(b, 12, 0);
+  lv_obj_set_style_bg_color(b, lv_color_hex(0x1F1F1F), 0);
+  void *ud = (void *)(intptr_t)step_min;
+  lv_obj_add_event_cb(b, almc_step_cb, LV_EVENT_SHORT_CLICKED,       ud);
+  lv_obj_add_event_cb(b, almc_step_cb, LV_EVENT_LONG_PRESSED_REPEAT, ud);
+  lv_obj_add_event_cb(b, almc_commit_cb, LV_EVENT_RELEASED,   nullptr);
+  lv_obj_add_event_cb(b, almc_commit_cb, LV_EVENT_PRESS_LOST, nullptr);
+  lv_obj_t *l = lv_label_create(b);
+  lv_obj_set_style_text_font(l, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(l, lv_color_white(), 0);
+  lv_label_set_text(l, txt);
+  lv_obj_center(l);
+  return b;
+}
+
+static void almc_enable_cb(lv_event_t *e) {
+  AlmClk *a = almc_ed();
+  if (!a) return;
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  a->en = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  almclk_save_csv();
+  almclk_rearm();
+  almc_refresh();
+}
+
+static void almc_repeat_cb(lv_event_t *e) {
+  AlmClk *a = almc_ed();
+  if (!a) return;
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  a->rep = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  if (a->rep && a->days == 0) a->days = 0x7F;  // fresh repeat: every day
+  almclk_save_csv();
+  almclk_rearm();
+  app_open_alarmedit();     // rebuild: the weekday row appears/disappears
+}
+
+static void almc_day_cb(lv_event_t *e) {
+  AlmClk *a = almc_ed();
+  if (!a) return;
+  lv_obj_t *b = (lv_obj_t *)lv_event_get_target(e);
+  uint8_t bit = (uint8_t)(intptr_t)lv_event_get_user_data(e);
+  if (lv_obj_has_state(b, LV_STATE_CHECKED)) a->days |=  (1 << bit);
+  else                                       a->days &= ~(1 << bit);
+  haptics_pulse(8);
+  almclk_save_csv();
+  almclk_rearm();
+  almc_refresh();
+}
+
+static void almc_delete_cb(lv_event_t *e) {
+  (void)e;
+  almclk_remove(s_almc_edit);
+  s_almc_edit = -1;
+  almclk_save_csv();
+  almclk_rearm();
+  haptics_pulse(15);
+  nav_back();               // back to the list, rebuilt without this alarm
+}
+
+static void almc_cleanup_cb(lv_event_t *e) {
+  (void)e;
+  almc_time_lbl = nullptr;
+  almc_next_lbl = nullptr;
+}
+
+/* ---- the list screen ---- */
+
+static void almc_row_click_cb(lv_event_t *e) {
+  s_almc_edit = (int)(intptr_t)lv_event_get_user_data(e);
+  nav_open(app_open_alarmedit);
+}
+static void almc_row_sw_cb(lv_event_t *e) {
+  int i = (int)(intptr_t)lv_event_get_user_data(e);
+  if (i < 0 || i >= s_almc_n) return;
+  lv_obj_t *sw = (lv_obj_t *)lv_event_get_target(e);
+  s_almcs[i].en = lv_obj_has_state(sw, LV_STATE_CHECKED);
+  almclk_save_csv();
+  almclk_rearm();
+  almc_list_hint();
+}
+static void almc_add_cb(lv_event_t *e) {
+  (void)e;
+  int i = almclk_add();
+  if (i < 0) return;                       // full (button is hidden then anyway)
+  almclk_save_csv();
+  almclk_rearm();
+  s_almc_edit = i;
+  nav_open(app_open_alarmedit);            // edit the fresh 07:00 alarm right away
+}
+
+static void app_open_alarmclock(void) {
+  app_screen_begin("Alarms");
+
+  lv_obj_t *col = lv_obj_create(app_scr);
+  lv_obj_set_size(col, 374, 410);
+  lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 80);
+  lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(col, 0, 0);
+  lv_obj_set_style_pad_all(col, 6, 0);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(col, 8, 0);     // scrolls if 8 alarms overflow it
+
+  almc_time_lbl = nullptr;                 // list screen has no editor widgets
+  almc_next_lbl = lv_label_create(col);
+  lv_obj_set_style_text_font(almc_next_lbl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(almc_next_lbl, lv_color_hex(0x999999), 0);
+
+  for (int i = 0; i < s_almc_n; i++) {
+    lv_obj_t *row = lv_obj_create(col);
+    lv_obj_set_size(row, LV_PCT(100), 64);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x161616), 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_radius(row, 12, 0);
+    lv_obj_set_style_pad_all(row, 8, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, almc_row_click_cb, LV_EVENT_CLICKED,
+                        (void *)(intptr_t)i);
+
+    lv_obj_t *t = lv_label_create(row);
+    lv_obj_set_style_text_font(t, &FONT_LABEL, 0);
+    lv_obj_set_style_text_color(t, s_almcs[i].en ? lv_color_white()
+                                                 : lv_color_hex(0x777777), 0);
+    lv_label_set_text_fmt(t, "%02u:%02u", s_almcs[i].h, s_almcs[i].m);
+    lv_obj_align(t, LV_ALIGN_TOP_LEFT, 4, -2);
+
+    char ds[32]; almc_days_str(&s_almcs[i], ds, sizeof ds);
+    lv_obj_t *d = lv_label_create(row);
+    lv_obj_set_style_text_font(d, &FONT_SMALL, 0);
+    lv_obj_set_style_text_color(d, lv_color_hex(0x999999), 0);
+    lv_label_set_text(d, ds);
+    lv_obj_align(d, LV_ALIGN_BOTTOM_LEFT, 4, 2);
+
+    lv_obj_t *sw = lv_switch_create(row);
+    lv_obj_set_style_bg_color(sw, lv_color_hex(ui_accent_hex()),
+                              LV_PART_INDICATOR | LV_STATE_CHECKED);
+    if (s_almcs[i].en) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    lv_obj_align(sw, LV_ALIGN_RIGHT_MID, -4, 0);
+    lv_obj_add_event_cb(sw, almc_row_sw_cb, LV_EVENT_VALUE_CHANGED,
+                        (void *)(intptr_t)i);
+  }
+
+  if (s_almc_n < ALMC_MAX)
+    tmr_btn(col, LV_SYMBOL_PLUS "  Add alarm", almc_add_cb, nullptr,
+            ui_accent_hex(), 220);
+
+  almc_list_hint();
+  lv_obj_add_event_cb(app_scr, almc_cleanup_cb, LV_EVENT_DELETE, nullptr);
+}
+
+/* ---- the per-alarm editor screen ---- */
+
+static void app_open_alarmedit(void) {
+  AlmClk *a = almc_ed();
+  if (!a) { nav_back(); return; }          // stale index — bail to the list
+
+  app_screen_begin("Alarm");
+
+  lv_obj_t *col = lv_obj_create(app_scr);
+  lv_obj_set_size(col, 374, 410);
+  lv_obj_align(col, LV_ALIGN_TOP_MID, 0, 80);
+  lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(col, 0, 0);
+  lv_obj_set_style_pad_all(col, 6, 0);
+  lv_obj_set_flex_flow(col, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(col, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                        LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_row(col, 10, 0);
+
+  almc_time_lbl = lv_label_create(col);
+  lv_obj_set_style_text_font(almc_time_lbl, &FONT_TIME, 0);
+  lv_obj_set_style_text_color(almc_time_lbl, lv_color_white(), 0);
+
+  almc_next_lbl = lv_label_create(col);
+  lv_obj_set_style_text_font(almc_next_lbl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(almc_next_lbl, lv_color_hex(0x999999), 0);
+
+  lv_obj_t *a1 = tmr_row(col);
+  almc_step_btn(a1, "-1h", -60);
+  almc_step_btn(a1, "+1h",  60);
+  lv_obj_t *a2 = tmr_row(col);
+  almc_step_btn(a2, "-5m",  -5);
+  almc_step_btn(a2, "+5m",   5);
+
+  // On/off switch.
+  lv_obj_t *er = tmr_row(col);
+  lv_obj_t *el = lv_label_create(er);
+  lv_obj_set_style_text_font(el, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(el, lv_color_hex(0xCCCCCC), 0);
+  lv_label_set_text(el, "Alarm enabled");
+  lv_obj_t *esw = lv_switch_create(er);
+  lv_obj_set_style_bg_color(esw, lv_color_hex(ui_accent_hex()),
+                            LV_PART_INDICATOR | LV_STATE_CHECKED);
+  if (a->en) lv_obj_add_state(esw, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(esw, almc_enable_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  // Repeat switch; checked reveals the weekday row below.
+  lv_obj_t *rr = tmr_row(col);
+  lv_obj_t *rl = lv_label_create(rr);
+  lv_obj_set_style_text_font(rl, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(rl, lv_color_hex(0xCCCCCC), 0);
+  lv_label_set_text(rl, "Repeat weekly");
+  lv_obj_t *rsw = lv_switch_create(rr);
+  lv_obj_set_style_bg_color(rsw, lv_color_hex(ui_accent_hex()),
+                            LV_PART_INDICATOR | LV_STATE_CHECKED);
+  if (a->rep) lv_obj_add_state(rsw, LV_STATE_CHECKED);
+  lv_obj_add_event_cb(rsw, almc_repeat_cb, LV_EVENT_VALUE_CHANGED, nullptr);
+
+  if (a->rep) {
+    // One checkable pill per weekday (bit0=Mon .. bit6=Sun).
+    static const char *DN[7] = { "Mo", "Tu", "We", "Th", "Fr", "Sa", "Su" };
+    lv_obj_t *dr = tmr_row(col);
+    lv_obj_set_style_pad_column(dr, 4, 0);
+    for (int d = 0; d < 7; d++) {
+      lv_obj_t *b = lv_btn_create(dr);
+      lv_obj_set_size(b, 44, 40);
+      lv_obj_set_style_radius(b, 10, 0);
+      lv_obj_add_flag(b, LV_OBJ_FLAG_CHECKABLE);
+      lv_obj_set_style_bg_color(b, lv_color_hex(0x1F1F1F), 0);
+      lv_obj_set_style_bg_color(b, lv_color_hex(ui_accent_hex()), LV_STATE_CHECKED);
+      if (a->days & (1 << d)) lv_obj_add_state(b, LV_STATE_CHECKED);
+      lv_obj_add_event_cb(b, almc_day_cb, LV_EVENT_VALUE_CHANGED,
+                          (void *)(intptr_t)d);
+      lv_obj_t *l = lv_label_create(b);
+      lv_obj_set_style_text_font(l, &FONT_SMALL, 0);
+      lv_obj_set_style_text_color(l, lv_color_white(), 0);
+      lv_label_set_text(l, DN[d]);
+      lv_obj_center(l);
+    }
+  }
+
+  tmr_btn(col, LV_SYMBOL_TRASH "  Delete", almc_delete_cb, nullptr, 0x5A1A1A, 220);
+
+  almc_refresh();
+  lv_obj_add_event_cb(app_scr, almc_cleanup_cb, LV_EVENT_DELETE, nullptr);
 }

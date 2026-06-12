@@ -5,7 +5,7 @@
  *  number of producers can feed it the current track and receive its commands:
  *    - AMS (Apple Media Service) over BLE       — ble_player_ams.h   (iPhone)
  *    - HTTP / server push                        — future
- *    - Android companion / other bridges         — future
+ *    - Android companion / other bridges        
  *  They all call the SAME small API here; the Player app UI (app_player.h) reads
  *  this state and sends commands without knowing which source is active.
  *

@@ -32,7 +32,15 @@
  * Deep sleep is separate and not shown here (menu only opens while awake). */
 static uint16_t s_wifi_active = 0;   // set by the fetch path while WiFi is up
 
-static uint16_t power_estimate_ma(void) {
+/* Calibration accessors used below but defined with the calibration code further
+ * down (single TU; declaration order only). */
+static float calib_awake_scale(void);     // learned multiplier on the raw awake model
+static float calib_sleep_floor_ma(void);  // learned deep-sleep floor (guess until learned)
+
+/* RAW awake model — the hand-tuned constants, never auto-corrected. Keep tuning
+ * these against a real USB power meter; the auto-learned scale below only fixes
+ * their SUM, never the per-component split (the gauge can't separate those). */
+static uint16_t power_estimate_ma_raw(void) {
   // CPU contribution: linear-ish between 80MHz(~20mA) and 240MHz(~45mA).
   float cpu_ma = 20.0f + (s_cpu_mhz - 80) * (25.0f / 160.0f);
   // Screen contribution: ~10mA at brightness 10, ~70mA at 255.
@@ -41,6 +49,13 @@ static uint16_t power_estimate_ma(void) {
   float wifi   = s_wifi_active ? 120.0f : 0.0f;
   float total  = cpu_ma + scr_ma + base + wifi;
   return (uint16_t)(total + 0.5f);
+}
+
+/* CALIBRATED awake estimate — the raw model times the scale factor learned from
+ * the battery gauge over completed discharge cycles (calib_learn_awake_scale).
+ * This is what the UI and all downstream consumers should use. */
+static uint16_t power_estimate_ma(void) {
+  return (uint16_t)((float)power_estimate_ma_raw() * calib_awake_scale() + 0.5f);
 }
 
 /* Instantaneous power estimate in milliwatts = est_mA * V_batt. */
@@ -80,7 +95,7 @@ static uint32_t rtc_now_epoch(void) {
  * A single cycle is noisy (the mA model is approximate), so we fold each cycle's
  * result into a RUNNING AVERAGE over the battery's whole life — the mean
  * converges toward an accurate figure as cycles accumulate. The average is stored
- * incrementally in NVS (one 'health' blob, ~12 bytes) so it needs NO history
+ * incrementally in NVS (one 'health' blob, 16 bytes) so it needs NO history
  * array and survives reboots/power-off. Health % = avg_mah / design_mah * 100.
  *
  * FUTURE (separate task): once avg_mah is trusted, back-calibrate
@@ -88,9 +103,10 @@ static uint32_t rtc_now_epoch(void) {
 struct BattHealth {
   uint16_t design_mah;     // design capacity this average was built against
   float    avg_mah;        // running mean of learned capacity (mAh)
-  uint16_t cycle_count;    // # of cycles folded into the mean
+  uint16_t cycle_count;    // # of samples folded into the mean (display)
+  float    weight;         // accumulated span-% weight driving the mean (see below)
 };
-static BattHealth s_health = { BATT_DESIGN_MAH, 0.0f, 0 };
+static BattHealth s_health = { BATT_DESIGN_MAH, 0.0f, 0, 0.0f };
 
 /* Optional SD trend-logger hook. Defined in batt_health_sd.h (included after this
  * file). Declared weakly here as a no-op fallback so power_model.h stands alone
@@ -100,10 +116,16 @@ static void batt_health_sd_log(uint32_t epoch, uint16_t cycle, int delta_pct,
 
 static void health_load(void) {
   size_t got = prefs.getBytes("health", &s_health, sizeof(s_health));
-  if (got != sizeof(s_health)) {           // absent/old -> fresh
+  if (got == 12) {
+    // Pre-weight layout (design/avg/count, 12 bytes incl. padding — a prefix of the
+    // current struct, so the fields above already landed correctly). Those cycles
+    // were learned under the old 40%-minimum gate, so weight them as 40 each.
+    s_health.weight = (float)s_health.cycle_count * 40.0f;
+  } else if (got != sizeof(s_health)) {    // absent/unknown -> fresh
     s_health.design_mah  = BATT_DESIGN_MAH;
     s_health.avg_mah     = 0.0f;
     s_health.cycle_count = 0;
+    s_health.weight      = 0.0f;
   }
   // If the design capacity was changed in code, rescale nothing — health is a %
   // of whatever design it learned against; just refresh the stored design field.
@@ -111,12 +133,17 @@ static void health_load(void) {
 }
 static void health_save(void) { prefs.putBytes("health", &s_health, sizeof(s_health)); }
 
-/* Fold one completed discharge cycle into the lifetime running average. */
+/* Fold one completed discharge cycle into the lifetime running average, WEIGHTED
+ * BY ITS SPAN. The gauge is 1%-quantized, so a sample's relative error scales as
+ * ~1/span (a 5% blip is ~8x noisier than a 40% cycle) — weighting by span lets us
+ * record every small top-up cycle without the noise swamping the mean. A 40% cycle
+ * still moves the average 8x more than a 5% one. */
 static void health_add_cycle(float learned_mah, int delta_pct, uint32_t now) {
-  if (learned_mah <= 0.0f) return;
-  // Incremental mean: avg += (x - avg) / (n + 1). Averages ALL cycles ever in a
-  // fixed ~12 bytes — no per-cycle history needed for the headline number.
-  s_health.avg_mah += (learned_mah - s_health.avg_mah) / (float)(s_health.cycle_count + 1);
+  if (learned_mah <= 0.0f || delta_pct <= 0) return;
+  // Weighted incremental mean: avg += w*(x - avg) / (W + w), W += w.
+  float w = (float)delta_pct;
+  s_health.avg_mah += w * (learned_mah - s_health.avg_mah) / (s_health.weight + w);
+  s_health.weight  += w;
   s_health.cycle_count++;
   health_save();
   // Per-cycle trend point goes to SD (if a card is present) for offline graphing;
@@ -135,16 +162,31 @@ static uint16_t health_get_cycles(void)  { return s_health.cycle_count; }
 /* ----- Discharge mAh accumulator (drives both time-left and health) -----
  * Between drain_update() calls we integrate model current over elapsed time to
  * get mAh consumed, and remember the % at which this discharge run started. Kept
- * in RTC RAM so a deep-sleep wake (a reboot) doesn't lose the in-progress cycle. */
-RTC_DATA_ATTR static float    cyc_mah_used    = 0.0f;  // model mAh since cycle start
+ * in RTC RAM so a deep-sleep wake (a reboot) doesn't lose the in-progress cycle.
+ *
+ * SPLIT INTEGRATION: drain_update() only runs while awake, so a long gap between
+ * calls is deep-sleep time. Charging sleep gaps at the AWAKE model rate (as the
+ * original single accumulator did) overcounts them ~50x, which both inflated the
+ * learned capacity AND made a naive model-vs-gauge comparison meaningless. So
+ * awake intervals accrue at the RAW awake model and sleep gaps at the learned
+ * sleep floor, separately — the leftover error then genuinely belongs to the
+ * awake model, which is what lets calib_learn_awake_scale() correct it. */
+RTC_DATA_ATTR static float    cyc_mah_awake   = 0.0f;  // RAW awake-model mAh this cycle
+RTC_DATA_ATTR static float    cyc_mah_sleep   = 0.0f;  // sleep-floor mAh this cycle
 RTC_DATA_ATTR static int8_t   cyc_start_pct   = -1;    // gauge % at cycle start
 RTC_DATA_ATTR static uint32_t cyc_last_epoch  = 0;     // last integration timestamp
 
-#define HEALTH_MIN_CYCLE_PCT  40   // need >=40% of span discharged to trust a cycle
+#define CYC_AWAKE_GAP_MAX_S  180   // gap between updates longer than this = deep sleep
+                                   // (awake, refresh_battery polls every few seconds)
 
-/* Forward decl: drain_update() triggers a calibration attempt once the gauge
- * %/hr has converged; the calibration code is defined below it. */
+#define HEALTH_MIN_CYCLE_PCT  5    // record any discharge >=5%; span-weighting in
+                                   // health_add_cycle keeps small (noisy) cycles
+                                   // from swamping the lifetime average
+
+/* Forward decls: drain_update() triggers calibration attempts; the calibration
+ * code is defined below it. */
 static void calib_try_learn(void);
+static void calib_learn_awake_scale(float real_mah, float sleep_mah, float awake_raw_mah);
 
 /* Call periodically with the current battery % and charging state. Updates the
  * %/hour estimate, integrates model mAh, and on a meaningful discharge cycle
@@ -170,27 +212,39 @@ static void drain_update(int pct, bool charging) {
   // --- mAh accumulation + health cycle detection ---
   if (charging) {
     // Charging ends/invalidates the discharge run. If we got a big enough span,
-    // learn a capacity sample before resetting.
+    // learn a capacity sample (and an awake-model scale sample) before resetting.
     if (cyc_start_pct >= 0) {
       int span = cyc_start_pct - pct;            // % actually discharged
       if (span < 0) span = 0;
-      if (span >= HEALTH_MIN_CYCLE_PCT && cyc_mah_used > 0.0f) {
-        float learned = cyc_mah_used / ((float)span / 100.0f);
+      float total_mah = cyc_mah_awake * calib_awake_scale() + cyc_mah_sleep;
+      if (span >= HEALTH_MIN_CYCLE_PCT && total_mah > 0.0f) {
+        float learned = total_mah / ((float)span / 100.0f);
         health_add_cycle(learned, span, now);
+        // Back-calibrate the awake model against the gauge: the cycle's REAL mAh
+        // (learned capacity x span) minus the sleep portion is what the awake
+        // intervals truly consumed; ratio that against the raw model integral.
+        float cap = (s_health.avg_mah > 0.0f) ? s_health.avg_mah : (float)BATT_DESIGN_MAH;
+        calib_learn_awake_scale(cap * (float)span / 100.0f, cyc_mah_sleep, cyc_mah_awake);
       }
     }
-    cyc_mah_used = 0.0f; cyc_start_pct = -1; cyc_last_epoch = 0;
+    cyc_mah_awake = 0.0f; cyc_mah_sleep = 0.0f; cyc_start_pct = -1; cyc_last_epoch = 0;
     return;
   }
 
-  // Discharging: integrate model current over the elapsed interval.
+  // Discharging: integrate model current over the elapsed interval. Short gaps are
+  // awake time (RAW awake model); long gaps are deep sleep (learned floor).
   if (cyc_start_pct < 0) {                        // start a fresh discharge run
     cyc_start_pct  = (int8_t)pct;
-    cyc_mah_used   = 0.0f;
+    cyc_mah_awake  = 0.0f;
+    cyc_mah_sleep  = 0.0f;
     cyc_last_epoch = now;
   } else if (now > cyc_last_epoch) {
-    float dt_h = (float)(now - cyc_last_epoch) / 3600.0f;
-    cyc_mah_used  += (float)power_estimate_ma() * dt_h;   // mA * h = mAh
+    uint32_t gap  = now - cyc_last_epoch;
+    float    dt_h = (float)gap / 3600.0f;
+    if (gap <= CYC_AWAKE_GAP_MAX_S)
+      cyc_mah_awake += (float)power_estimate_ma_raw() * dt_h;   // mA * h = mAh
+    else
+      cyc_mah_sleep += calib_sleep_floor_ma() * dt_h;
     cyc_last_epoch = now;
   }
 }
@@ -233,12 +287,21 @@ static float drain_get_hours_left(int pct) {
 struct PowerCalib {
   float    sleep_ma;     // learned deep-sleep floor current (mA)
   uint16_t samples;      // # of windows folded into the average
+  float    awake_scale;  // learned multiplier on the raw awake model (1.0 = as-coded)
+  uint16_t k_samples;    // # of cycles folded into awake_scale
 };
-static PowerCalib s_calib = { 0.0f, 0 };
+static PowerCalib s_calib = { 0.0f, 0, 1.0f, 0 };
 
 static void calib_load(void) {
-  if (prefs.getBytes("calib", &s_calib, sizeof(s_calib)) != sizeof(s_calib)) {
+  size_t got = prefs.getBytes("calib", &s_calib, sizeof(s_calib));
+  if (got == 8) {
+    // Pre-awake-scale layout (sleep_ma/samples, 8 bytes — a prefix of the current
+    // struct, so the fields above already landed correctly). Scale not learned yet.
+    s_calib.awake_scale = 1.0f;
+    s_calib.k_samples   = 0;
+  } else if (got != sizeof(s_calib)) {
     s_calib.sleep_ma = 0.0f; s_calib.samples = 0;
+    s_calib.awake_scale = 1.0f; s_calib.k_samples = 0;
   }
 }
 static void calib_save(void) { prefs.putBytes("calib", &s_calib, sizeof(s_calib)); }
@@ -246,6 +309,32 @@ static void calib_save(void) { prefs.putBytes("calib", &s_calib, sizeof(s_calib)
 static float    calib_get_sleep_ma(void) { return s_calib.sleep_ma; }
 static uint16_t calib_get_samples(void)  { return s_calib.samples; }
 static bool     calib_is_learned(void)   { return s_calib.samples > 0; }
+
+/* Awake-model multiplier (1.0 until at least one cycle has been learned). */
+static float calib_awake_scale(void) {
+  return (s_calib.k_samples > 0 && s_calib.awake_scale > 0.0f) ? s_calib.awake_scale : 1.0f;
+}
+static uint16_t calib_get_k_samples(void) { return s_calib.k_samples; }
+
+/* Sleep-floor current for cycle integration: the learned value once available,
+ * else a conservative guess for this board (S3 deep sleep + PMU + RTC ~1mA). */
+#define SLEEP_FLOOR_GUESS_MA  1.0f
+static float calib_sleep_floor_ma(void) {
+  return calib_is_learned() ? s_calib.sleep_ma : SLEEP_FLOOR_GUESS_MA;
+}
+
+/* Fold one awake-model scale sample from a completed discharge cycle:
+ *   k = (real_total_mAh - sleep_mAh) / raw_awake_model_mAh
+ * Guarded: needs a meaningful awake share (tiny denominators are pure noise) and
+ * a plausible ratio (one bad gauge read can't wreck the average). */
+static void calib_learn_awake_scale(float real_mah, float sleep_mah, float awake_raw_mah) {
+  if (awake_raw_mah < 5.0f) return;            // <5 model-mAh awake -> too noisy
+  float k = (real_mah - sleep_mah) / awake_raw_mah;
+  if (k < 0.3f || k > 3.0f) return;            // implausible -> reject the sample
+  s_calib.awake_scale += (k - s_calib.awake_scale) / (float)(s_calib.k_samples + 1);
+  s_calib.k_samples++;
+  calib_save();
+}
 
 /* Awake/sleep time accounting for the duty cycle (RTC RAM -> survives sleep
  * reboots). The lifecycle code notes how long each wake stayed awake and how long

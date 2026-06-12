@@ -15,7 +15,7 @@
 #pragma once
 #include <lvgl.h>
 
-/* ---- Watch-face widgets (Fossil-style: 3 colored stat columns + big clock) --
+/* ---- Watch-face widgets (3 colored stat columns + big clock) --
  * Top row, three columns, each = a colored icon with a value label below it:
  *   [battery icon + NN%]   [blue calendar + "June 4"]   [red day + "Thu"]
  * Center: enormous HH:MM clock.

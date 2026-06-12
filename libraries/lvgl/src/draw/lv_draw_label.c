@@ -480,7 +480,17 @@ void lv_draw_label_iterate_characters(lv_draw_task_t * t, const lv_draw_label_ds
                 logical_char_pos -= (LABEL_RECOLOR_PAR_LENGTH + 1);
             }
 
-            lv_font_get_glyph_dsc(font, &glyph_dsc, letter, letter_next);
+            /* ESP32-S3-WatchFace LOCAL PATCH: time the per-character glyph-dsc
+             * lookup (slot 16 of g_lv_draw_type_us — a SUBSET of "label"). */
+            {
+                extern uint32_t g_lv_draw_type_us[20];
+                extern uint32_t g_lv_draw_type_cnt[20];
+                extern int64_t esp_timer_get_time(void);
+                uint32_t watch_t0 = (uint32_t)esp_timer_get_time();
+                lv_font_get_glyph_dsc(font, &glyph_dsc, letter, letter_next);
+                g_lv_draw_type_us[16] += (uint32_t)esp_timer_get_time() - watch_t0;
+                g_lv_draw_type_cnt[16]++;
+            }
             letter_w = lv_text_is_marker(letter) ? 0 : glyph_dsc.adv_w;
 
             /*Always set the bg_coordinates for placeholder drawing*/

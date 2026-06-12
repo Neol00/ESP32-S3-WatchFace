@@ -21,8 +21,8 @@
  *    Arduino Runs On:                      "Core 1"
  *    Flash Size:                           32MB (fixed by the board)
  *    Partition:                            "Custom"  -> uses partitions.csv in THIS
- *                                          sketch folder (20KB NVS + 8MB app0/app1
- *                                          + 15.9MB FAT on the 32MB chip). app0 is
+ *                                          sketch folder (20KB NVS + 4MB app0/app1
+ *                                          + 24MB FAT on the 32MB chip). app0 is
  *                                          pinned at 0x10000 (the core flashes the
  *                                          app there) — moving it (e.g. a bigger NVS
  *                                          before it, or "Max APP 32MB") boots to a
@@ -107,6 +107,10 @@ Arduino_CO5300 *co5300 = new Arduino_CO5300(
   bus, LCD_RESET, 0 /* rotation */, LCD_WIDTH, LCD_HEIGHT,
   22 /* col_offset1 */, 0 /* row_offset1 */, 0 /* col_offset2 */, 0 /* row_offset2 */);
 Arduino_GFX *gfx = co5300;
+
+/* Bus-typed pointer for the async flush: writePixelsBeAsync()/waitAsync() are
+ * LOCAL PATCH additions on Arduino_ESP32QSPI, not the Arduino_DataBus base. */
+Arduino_ESP32QSPI *qspi_bus = static_cast<Arduino_ESP32QSPI *>(bus);
 
 /* ---- Touch: FT3168 over I2C ---------------------------------------------- */
 std::shared_ptr<Arduino_IIC_DriveBus> IIC_Bus =
@@ -195,14 +199,18 @@ RTC_DATA_ATTR static uint32_t rtc_last_ntp_epoch = 0;
  * no slow PSRAM read per push), and we use TWO so LVGL can render the next tile while
  * the previous one is being sent. Leave DIRECT_RENDER_MODE undefined.
  *
- * SIZING: only ~80KB internal SRAM is free TOTAL (the About page's "free" and "max
- * block" are two views of the SAME pool, not two separate 80KB pools). So BOTH buffers
- * must share that ~80KB. At 40 lines each: 374w * 40 * 2B = ~30KB per buffer, ~60KB for
- * the pair, leaving ~20KB SRAM headroom. Smaller tiles => more flush calls per frame,
+ * Smaller tiles => more flush calls per frame,
  * but each is a fast SRAM->QSPI partial push — still far cheaper than the old fullscreen
- * blit. If SRAM ever gets tighter, drop to 30 (~22KB each); if it frees up, raise it. */
+ * blit.
+ *
+ * SIZING IS FIXED AT COMPILE TIME — do NOT size this from free-heap at boot. I
+ * tried that (tallest tier that left a reserve): a boot-time free-RAM check can't
+ * know what BLE/WiFi bring-up will allocate LATER, and a too-tall tier starved the
+ * radios -> alloc-failure panic -> bootloop. 110 spends part of the ~74KB of .bss
+ * the notif/wifi stores freed when they moved to PSRAM: pair = ~148KB, 
+ * so net headroom is still ~20KB ABOVE . */
 // #define DIRECT_RENDER_MODE
-#define PARTIAL_BUF_LINES 48           // lines per partial buffer (x2); ~36KB each ~72KB total
+#define PARTIAL_BUF_LINES 104           // lines per partial buffer (x2)
 static uint32_t screenWidth, screenHeight, bufSize;
 static lv_display_t *disp;
 static lv_color_t *disp_draw_buf;
@@ -235,9 +243,14 @@ static uint32_t lastMillis = 0;
 #include "settings_store.h"
 #include "power_model.h"
 #include "haptics.h"          // vibration motor (GPIO18) — non-blocking pattern player
-#include "timer_store.h"      // countdown-timer state (uses rtc_now_epoch + prefs)
+#define AUDIO_SMALL_SPEAKER 0 // 1 = THIS watch has the tiny in-ear speaker mod (full drive).
+                              // Set to 0 (or delete) when building for a stock watch — the
+                              // original speaker clips and can be damaged at full drive!
+#include "audio_alarm.h"      // alarm chime: ES8311 codec + speaker amp (synthesized, no files)
 #include "sd_card.h"          // shared 1-bit SD_MMC mount (WiFi CSV + battery log)
 #include "storage_fs.h"       // pick SD-if-present-else-FFat for ALL persistent files
+#include "timer_store.h"      // countdown timer + alarm clocks (rtc_now_epoch, prefs,
+                              // alarms.csv via store_fs — hence AFTER storage_fs.h)
 /* Optional SD trend-logger for battery health — MUST follow power_model.h, which
  * forward-declares batt_health_sd_log(); this defines it. Degrades to a no-op if
  * no SD card is present (the NVS running-average health is unaffected). */
@@ -344,6 +357,7 @@ static void notif_show(uint64_t id, const char *title, const char *body) {
   lv_label_set_text(notif_body, body);
   lv_obj_clear_flag(notif_card, LV_OBJ_FLAG_HIDDEN);
   lv_obj_move_foreground(notif_card);
+  audio_notify_ding();   // single short note (mute-aware; silent while the alarm rings)
 }
 
 /* Hide the pop-up card from the watch face. This ONLY dismisses the card off the
@@ -372,6 +386,8 @@ static void notif_dismiss(void) {
 #include "ble_player_ams.h"     // AMS client: iPhone media (now-playing + controls) -> the Player.
                                 // Included here (after notif_store/archive/net) because it feeds
                                 // notif_store_add / na_append / s_pop_* and is called by ble_provision.h.
+#include "ble_gadgetbridge.h"   // Gadgetbridge server: ANDROID notifications (Bangle.js protocol)
+                                // -> the same store + the same s_pop_*/dirty handoff as ANCS.
 
 /* Read the PMU and update the status row. Shows VBUS (charging input) voltage
  * while charging, otherwise the battery voltage. Returns true if anything
@@ -395,6 +411,25 @@ static bool refresh_battery(void) {
   i2c_unlock();
 
   drain_update(pct, chg);   // feed the %/hour tracker (runs even if display unchanged)
+
+  // Report battery to a connected phone (BAS notify + Gadgetbridge status line) on
+  // any %/charger change, plus ONCE per connection — delayed ~3s past connect so it
+  // lands after the phone has subscribed (CCCD writes take a moment). Runs before
+  // the display early-out below so the initial report fires even when nothing
+  // visible changed.
+  static bool     s_batt_reported   = false;
+  static uint32_t s_batt_conn_since = 0;
+  if (!ble_phone_connected()) {
+    s_batt_conn_since = 0;
+    s_batt_reported   = false;
+  } else {
+    if (!s_batt_conn_since) s_batt_conn_since = millis();
+    bool settled = millis() - s_batt_conn_since > 3000;
+    if ((settled && !s_batt_reported) || pct != s_batt_pct || chg != s_charging) {
+      ble_report_battery(pct, chg);
+      s_batt_reported = true;
+    }
+  }
 
   if (pct == s_batt_pct && chg == s_charging && mv == s_mv) return false;
   s_batt_pct = pct;
@@ -426,10 +461,110 @@ static uint32_t millis_cb(void) {
 static volatile bool s_lvgl_drew = false;
 static inline bool lvgl_took_dirty(void) { bool d = s_lvgl_drew; s_lvgl_drew = false; return d; }
 
+#if CPU_PROFILE_SERIAL
+/* Flush-vs-render split: total time the CPU is tied up by the panel push. With the
+ * sync path that was the whole (blocking) transfer — measured 38-43% of loop body.
+ * With the async path it's only the swap+addr-window+queue cost; the wire time
+ * overlaps the next tile's render. Printed with the [loop] line every 10 s. */
+static uint32_t s_flush_us = 0, s_flush_calls = 0, s_flush_px = 0;
+/* Async-path phase breakdown: where exactly the blocked time inside the flush
+ * goes. swap = byte-order pass; addr = address-window commands (CS_LOW here also
+ * DRAINS any still-flying previous tile, so a fat addr number = pipeline stall =
+ * wire longer than render); queue = handing segments to the DMA driver. */
+static uint32_t s_fl_swap_us = 0, s_fl_addr_us = 0, s_fl_queue_us = 0;
+#endif
+
+/* ASYNC FLUSH (set in setup): true when both partial buffers are DMA-capable
+ * internal SRAM. False on the PSRAM fallback (SPI DMA can't read PSRAM) — then
+ * the legacy blocking draw16bitRGBBitmap path runs instead. */
+static bool s_flush_async = false;
+
+/* A/B knob: 1 = LVGL renders in panel byte order (no swap pass in the flush, but
+ * every blend runs through the RGB565_SWAPPED loops). 0 = plain RGB565 render
+ * (the better-trodden blend loops) + a ~2.5 ms/tile swap pass in the flush.
+ * Compare the [draw] label/fill times between builds to measure the swapped-
+ * blend tax — decides the endgame, since the PIE SIMD asm targets plain RGB565. */
+/* A/B RESULT (2026-06-11): per-label cost IDENTICAL in both formats (~1.0 ms) —
+ * no swapped-blend tax. 1 is strictly better (saves the ~2.5 ms/tile swap). */
+#define FLUSH_RENDER_SWAPPED 1
+
+/* Glyph-buffer allocator for LVGL's FONT draw-buf handlers (hooked in setup —
+ * see the comment there). lv_draw_buf_handlers_t's fields live in a private
+ * header; including it is fine, the lib is vendored in this repo. */
+#include <draw/lv_draw_buf_private.h>
+static void *glyph_buf_malloc(size_t size, lv_color_format_t cf) {
+  (void)cf;
+  void *p = heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  if (!p) p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return p;
+}
+static void glyph_buf_free(void *p) {
+  heap_caps_free(p);
+}
+
+/* LOCAL PATCH in lvgl/src/font/fmt_txt/lv_font_fmt_txt.c: decoded-glyph cache —
+ * the 4bpp->A8 unpack was 45% of label render time ([draw] g.unpack), re-run
+ * 63k times/10s for a few hundred distinct glyphs. Init from setup() while
+ * still single-threaded; before init the cache is a transparent no-op. */
+extern "C" void lv_font_fmt_txt_glyph_cache_init(void);
+
+/* SPI transfer-done -> hand the buffer back to LVGL. INTERRUPT context: this runs
+ * from the SPI master ISR after the tile's last DMA segment. lv_disp_flush_ready
+ * only clears the display's flushing flags, which is the canonical ISR use. */
+static void flush_done_cb(void *arg) {
+  lv_disp_flush_ready((lv_display_t *)arg);
+}
+
 static void my_disp_flush(lv_display_t *d, const lv_area_t *area, uint8_t *px_map) {
 #ifndef DIRECT_RENDER_MODE
   uint32_t w = lv_area_get_width(area), h = lv_area_get_height(area);
+#if CPU_PROFILE_SERIAL
+  uint32_t f0 = micros();
+#endif
+  if (s_flush_async) {
+    // ASYNC: send the address window (sync commands — these drain any still-in-
+    // flight previous tile, which is exactly the pipelining handshake), queue the
+    // whole tile as DMA and RETURN. lv_disp_flush_ready fires from the transfer-
+    // done ISR, so LVGL renders the next tile while this one is on the wire.
+#if FLUSH_RENDER_SWAPPED && LV_DRAW_SW_SUPPORT_RGB565_SWAPPED
+    // Display renders LV_COLOR_FORMAT_RGB565_SWAPPED — tile is wire-ready as is.
+#else
+    // Plain RGB565 render: convert to panel byte order here (~2.5 ms/tile).
+    lv_draw_sw_rgb565_swap(px_map, w * h);
+#endif
+#if CPU_PROFILE_SERIAL
+    uint32_t f1 = micros(); s_fl_swap_us += (uint32_t)(f1 - f0);
+#endif
+    gfx->startWrite();
+    co5300->writeAddrWindow(area->x1, area->y1, w, h);
+#if CPU_PROFILE_SERIAL
+    uint32_t f2 = micros(); s_fl_addr_us += (uint32_t)(f2 - f1);
+#endif
+    if (qspi_bus->writePixelsBeAsync(px_map, w * h * 2, flush_done_cb, d)) {
+#if CPU_PROFILE_SERIAL
+      s_fl_queue_us += (uint32_t)(micros() - f2);
+#endif
+      gfx->endWrite();
+      s_lvgl_drew = true;
+#if CPU_PROFILE_SERIAL
+      s_flush_us += (uint32_t)(micros() - f0);   // CPU-side cost only (swap+queue)
+      s_flush_calls++;
+      s_flush_px += w * h;
+#endif
+      return;                  // NO flush_ready here — the DMA-done callback delivers it
+    }
+    // Tile too big for the async segments (can't happen at current buffer sizes,
+    // but stay correct): the buffer is in PANEL byte order and the legacy path
+    // byte-swaps during its copy, so convert back to little-endian first.
+    lv_draw_sw_rgb565_swap(px_map, w * h);
+    gfx->endWrite();
+  }
   gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t *)px_map, w, h);
+#if CPU_PROFILE_SERIAL
+  s_flush_us += (uint32_t)(micros() - f0);
+  s_flush_calls++;
+  s_flush_px += w * h;
+#endif
 #endif
   s_lvgl_drew = true;        // LVGL re-rendered -> the loop will push the panel once
   lv_disp_flush_ready(d);
@@ -442,6 +577,22 @@ static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
     data->state = LV_INDEV_STATE_REL;
     return;
   }
+
+  // FAST PATH — the 24/7 idle case. LVGL polls this at LV_DEF_REFR_PERIOD (8 ms,
+  // ~125 Hz) and the full read below is THREE I2C transactions (~0.5 ms blocked on
+  // the shared bus) — that was a constant ~6-10% of core 1 with nobody touching
+  // (found via the [cpu]/[loop] profilers). The TP_INT interrupt already tells us
+  // when a touch ARRIVES (ISR sets IIC_Interrupt_Flag), so: no edge since the last
+  // poll AND no finger down at the last poll -> nobody is touching -> report
+  // "released" with ZERO I2C. While a finger IS down we keep polling at the full
+  // rate (monitor mode keeps the flag false during a hold — the s_tp_was_down
+  // latch covers that), so drag/scroll tracking is completely unaffected.
+  static bool s_tp_was_down = false;
+  if (!FT3168->IIC_Interrupt_Flag && !s_tp_was_down) {
+    data->state = LV_INDEV_STATE_REL;
+    return;
+  }
+
   i2c_lock();   // shared bus: don't interleave with the net task's RTC ops (core 0)
   int32_t fingers = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_FINGER_NUMBER);
   int32_t x = FT3168->IIC_Read_Device_Value(FT3168->Arduino_IIC_Touch::Value_Information::TOUCH_COORDINATE_X);
@@ -480,6 +631,7 @@ static void my_touchpad_read(lv_indev_t *indev, lv_indev_data_t *data) {
   } else {
     data->state = LV_INDEV_STATE_REL;   // no live finger -> released (never a stale press)
   }
+  s_tp_was_down = finger_down;  // keep polling I2C until the release is seen (fast path gate)
 }
 
 /* CO5300 requires draw areas aligned to even pixel boundaries. (An LVGL display
@@ -515,6 +667,7 @@ void setup() {
   settings_load();
   timer_load();            // countdown state (so a TIMER wake can ring it)
   haptics_init();          // vibration motor pin (cheap; ready on every path)
+  audio_alarm_init();      // park the codec/amp rail OFF (ready if a TIMER wake rings)
   // Saved WiFi networks — needed before any wifi_connect(), including the light
   // background-check path, so it can connect on a timer wake too.
   wifi_nets_load();
@@ -559,6 +712,9 @@ void setup() {
   //   TIMER wake          -> scheduled background notification check (light path)
   //   PWR press / power-on -> full interactive UI
   Wire.begin(IIC_SDA, IIC_SCL);
+  audio_alarm_quiesce_codec();  // ES8311 is on the always-on rail and survives every
+                                // reboot — force it to standby in case a crash mid-ring
+                                // (or older firmware) left its analog blocks powered.
 
   // A previous deep sleep may have cut proven-safe peripheral rails. Bring the PMU
   // up and restore them NOW — before the RTC read and gfx->begin() below — so the
@@ -595,10 +751,10 @@ void setup() {
   esp_sleep_wakeup_cause_t wake = esp_sleep_get_wakeup_cause();
   // Remember a BOOT wake so the loop swallows that same still-held press.
   s_woke_from_boot = (wake == ESP_SLEEP_WAKEUP_EXT0);
-  if (wake == ESP_SLEEP_WAKEUP_TIMER && timer_is_due()) {
-    // The countdown elapsed while asleep: do NOT go back to sleep — fall through
-    // to the full UI boot so the loop fires the alarm (overlay + vibration).
-    USBSerial.println("[wake] timer alarm due -> full boot");
+  if (wake == ESP_SLEEP_WAKEUP_TIMER && (timer_is_due() || almclk_is_due())) {
+    // The countdown elapsed / the alarm clock's time arrived while asleep: do NOT
+    // go back to sleep — fall through to the full UI boot so the loop rings it.
+    USBSerial.println("[wake] timer/alarm-clock due -> full boot");
   } else if (s_checks_enabled && wake == ESP_SLEEP_WAKEUP_TIMER) {
     USBSerial.println("[wake] timer -> background check");
     background_check_has_new();           // returns (new notif) OR sleeps again
@@ -608,6 +764,12 @@ void setup() {
     // so do one immediate fetch once the UI is up rather than waiting 30s.
     s_check_on_wake = true;
   }
+
+  // Full boot from here on. Load the alarm-clock list (alarms.csv on SD/FFat) and
+  // recompute its targets — AFTER the wake branch, so a background-check wake that
+  // goes straight back to sleep never mounts storage for it (the wake test above
+  // only needs the NVS-mirrored earliest target loaded by timer_load()).
+  almclk_load();
 
   // Drive the display QSPI bus at 80 MHz instead of the library default 40 MHz.
   // The full-frame push is ~2/3 of each animation frame; doubling the bus clock
@@ -742,6 +904,22 @@ void setup() {
 
   lv_init();
   lv_tick_set_cb(millis_cb);
+
+  // --- Glyph draw-bufs -> internal SRAM -------------------------------------
+  // LVGL unpacks every glyph's 4bpp bitmap into an A8 "font draw buf" and the
+  // blender reads it back. Those buffers come from the FONT draw-buf handlers,
+  // whose default malloc is lv_malloc = our PSRAM allocator — so every glyph on
+  // screen was WRITTEN to and READ back from PSRAM, every frame. The [draw]
+  // profiler showed labels at ~80% of render time (~1 ms/label) because of it.
+  // The buffers are tiny (box_w x ~32 rows of A8 = a few KB, transient), so give
+  // the font handlers a dedicated SRAM alloc with PSRAM fallback. Must run before
+  // any text renders; the workers allocate via these cbs (heap_caps is task-safe).
+  {
+    lv_draw_buf_handlers_t *fh = lv_draw_buf_get_font_handlers();
+    fh->buf_malloc_cb = glyph_buf_malloc;
+    fh->buf_free_cb   = glyph_buf_free;
+  }
+  lv_font_fmt_txt_glyph_cache_init();   // decoded-glyph cache (see decl above)
 #if LV_USE_LOG != 0
   lv_log_register_print_cb(my_print);
 #endif
@@ -769,13 +947,15 @@ void setup() {
   if (!disp_draw_buf) disp_draw_buf = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
   disp_draw_buf2 = NULL;
 #else
-  // PARTIAL: two small line-buffers in INTERNAL SRAM. SRAM (not PSRAM) so the CPU read
+  // PARTIAL: two line-buffers in INTERNAL SRAM. SRAM (not PSRAM) so the CPU read
   // that feeds QSPI in writePixels is fast; two of them so LVGL renders the next tile
-  // while the previous flushes. ~30KB each @ 374w*40lines*2B, ~60KB for the pair (fits
-  // the ~80KB free internal SRAM with headroom). Fall back to PSRAM only if internal
-  // SRAM can't satisfy it (slower, but still partial-area pushes).
-  disp_draw_buf  = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-  disp_draw_buf2 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  // while the previous flushes. Fixed size — see the PARTIAL_BUF_LINES comment for
+  // why this must NOT be sized from free-heap at boot. Fall back to PSRAM only if
+  // internal SRAM can't satisfy it (slower, but still partial-area pushes).
+  // MALLOC_CAP_DMA: the async flush queues SPI DMA straight from these buffers
+  // (no bounce copy), so they must come from DMA-capable internal SRAM.
+  disp_draw_buf  = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+  disp_draw_buf2 = (lv_color_t *)heap_caps_malloc(bufSize * 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
   if (!disp_draw_buf || !disp_draw_buf2) {
     USBSerial.println("[gfx] partial bufs didn't fit in SRAM — falling back to PSRAM");
     if (disp_draw_buf)  { heap_caps_free(disp_draw_buf);  disp_draw_buf  = NULL; }
@@ -794,10 +974,18 @@ void setup() {
   {
     bool b1_sram = esp_ptr_internal(disp_draw_buf);
     bool b2_sram = disp_draw_buf2 ? esp_ptr_internal(disp_draw_buf2) : true;
-    USBSerial.printf("[gfx] partial bufs: %u KB x2 in %s; internal SRAM now %u KB free\n",
+    USBSerial.printf("[gfx] partial bufs: %u lines, %u KB x2 in %s; internal SRAM now %u KB free\n",
+                     (unsigned)(bufSize / screenWidth),
                      (unsigned)((bufSize * 2) / 1024),
                      (b1_sram && b2_sram) ? "SRAM (fast)" : "PSRAM (SLOW fallback)",
                      (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024));
+    // Async flush needs SPI-DMA-readable buffers; PSRAM fallback can't, so it
+    // keeps the legacy blocking flush.
+    s_flush_async = disp_draw_buf2 &&
+                    esp_ptr_dma_capable(disp_draw_buf) &&
+                    esp_ptr_dma_capable(disp_draw_buf2);
+    USBSerial.printf("[gfx] flush path: %s\n",
+                     s_flush_async ? "ASYNC (DMA tile overlaps next render)" : "sync (blocking)");
   }
 #endif
 
@@ -807,6 +995,18 @@ void setup() {
   lv_display_set_buffers(disp, disp_draw_buf, NULL, bufSize * 2, LV_DISPLAY_RENDER_MODE_DIRECT);
 #else
   lv_display_set_buffers(disp, disp_draw_buf, disp_draw_buf2, bufSize * 2, LV_DISPLAY_RENDER_MODE_PARTIAL);
+#if FLUSH_RENDER_SWAPPED && LV_DRAW_SW_SUPPORT_RGB565_SWAPPED
+  if (s_flush_async) {
+    // Render directly in PANEL byte order (big-endian RGB565). The [flush] profiler
+    // showed the post-render swap pass eating ~2.5 ms/tile (93% of the flush cost);
+    // with this format the swap happens inside the blend loops while pixels are
+    // already in registers — effectively free — and my_disp_flush queues the tile
+    // exactly as rendered. screen_cache snapshots pin LV_COLOR_FORMAT_RGB565 and
+    // blit via the legacy converting path, so they are unaffected. Same 16 bpp, so
+    // buffer sizing is unchanged.
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565_SWAPPED);
+  }
+#endif  /* FLUSH_RENDER_SWAPPED */
 #endif
 
   lv_indev_t *indev = lv_indev_create();
@@ -879,6 +1079,9 @@ static uint32_t lastNotifMs = 0;  // notification fetch timer
 void loop() {
   uint32_t ms = millis();
   bool dirty = false;  // did anything visible change?
+#if CPU_PROFILE_SERIAL
+  uint32_t lp_t0 = micros();   // loop micro-profile: body-time capture (see loop tail)
+#endif
 
   // NOTE: BOOT is polled FIRST, before lv_task_handler(), so heavy touch/render
   // work in LVGL can't delay or starve the button check.
@@ -941,6 +1144,7 @@ void loop() {
   // Drive the vibration motor's pattern state machine every loop (just GPIO, no
   // I2C) so the alarm's heartbeat buzz stays crisp.
   haptics_tick(ms);
+  audio_alarm_tick();    // finish a notification ding's teardown once it's done sounding
 
   // Background-mount the SD card: the early-boot attempts ran before the SD rail was
   // powered, so this retries (rate-limited) until the card mounts or is ruled absent.
@@ -978,7 +1182,9 @@ void loop() {
     }
     // Countdown reached zero while we're awake -> ring. (timer_is_due() reads the
     // RTC with its own i2c_lock, so it must run OUTSIDE the lock taken above.)
-    if (!g_alarm_active && timer_is_due()) alarm_fire();
+    if (!g_alarm_active && timer_is_due())  alarm_fire();
+    // Wall-clock alarm reached its set time -> ring (same overlay/chime).
+    if (!g_alarm_active && almclk_is_due()) almclk_fire();
   }
 
   // --- Battery + bell: poll every 20s. (WiFi indicator is refreshed on the 15s
@@ -1192,9 +1398,80 @@ void loop() {
     enter_deep_sleep();  // does not return (never while on USB)
   }
 
-  // Adaptive pacing: spin fast (1 ms) only while something is actually animating —
-  // menu/shade/alarm or a dirty frame — so the frame rate is high during motion but
-  // the idle clock face stays at the cheap 5 ms cadence (lower power before sleep).
-  bool busy = dirty || app_menu_is_open() || quick_shade_active() || g_alarm_active;
-  delay(busy ? 1 : 5);
+  // Per-task CPU profiler -> serial, every 10 s (measured-runtime libs only; no-op
+  // on stock libs). Attribute standing load here; CPU_PROFILE_SERIAL 0 to silence.
+  cpu_usage_profile_tick();
+
+  // Adaptive pacing: spin fast (1 ms) only while something drew RECENTLY — scroll
+  // inertia, animations and touch feedback mark `dirty` every frame, so motion holds
+  // the fast cadence and the 500 ms tail covers between-frame gaps. A menu sitting
+  // STILL drops to the same cheap 5 ms poll as the idle clock face (it used to hold
+  // 1 ms the whole time a menu was open — a constant ~10% of core 1 for nothing;
+  // the per-task profiler caught it). Tap pickup latency is unchanged either way:
+  // LVGL reads the touch controller on its own ~30 ms indev timer, and the first
+  // touch-feedback frame marks dirty, which restores the 1 ms cadence instantly.
+  static uint32_t s_last_motion_ms = 0;
+  if (dirty || quick_shade_active() || g_alarm_active) s_last_motion_ms = ms;
+  bool fast_pace = (ms - s_last_motion_ms < 500);
+
+#if CPU_PROFILE_SERIAL
+  // Loop micro-profile companion to the per-task dump: pass rate, average body
+  // time, and how many passes were fast / actually drew. Distinguishes "each pass
+  // is too expensive" from "the cadence is stuck fast because something keeps
+  // marking dirty". Printed on the same ~10 s rhythm as the task table.
+  {
+    static uint32_t lp_win0 = 0, lp_passes = 0, lp_fast = 0, lp_drew = 0;
+    static uint64_t lp_body_us = 0;
+    lp_passes++;
+    if (fast_pace) lp_fast++;
+    if (dirty)     lp_drew++;
+    lp_body_us += (uint32_t)(micros() - lp_t0);
+    if (lp_win0 == 0) lp_win0 = ms;
+    else if (ms - lp_win0 >= 10000) {
+      USBSerial.printf("[loop] %lu passes/10s (%lu fast, %lu drew), avg body %lu us\n",
+                       (unsigned long)lp_passes, (unsigned long)lp_fast,
+                       (unsigned long)lp_drew, (unsigned long)(lp_body_us / lp_passes));
+      if (s_flush_calls) {
+        // flush share of body time = how much an async (non-blocking) flush could
+        // reclaim for rendering; MB/s = effective panel-link throughput incl. setup.
+        uint32_t share = lp_body_us ? (uint32_t)((uint64_t)s_flush_us * 100 / lp_body_us) : 0;
+        uint32_t mbps10 = s_flush_us ? (uint32_t)((uint64_t)s_flush_px * 2 * 10 / s_flush_us) : 0;
+        USBSerial.printf("[flush] %lu calls, %lu us total (avg %lu us/call), %lu%% of body, %lu.%lu MB/s\n",
+                         (unsigned long)s_flush_calls, (unsigned long)s_flush_us,
+                         (unsigned long)(s_flush_us / s_flush_calls), (unsigned long)share,
+                         (unsigned long)(mbps10 / 10), (unsigned long)(mbps10 % 10));
+        USBSerial.printf("[flush]   avg/call: swap %lu us, addr+drain %lu us, queue %lu us\n",
+                         (unsigned long)(s_fl_swap_us / s_flush_calls),
+                         (unsigned long)(s_fl_addr_us / s_flush_calls),
+                         (unsigned long)(s_fl_queue_us / s_flush_calls));
+        s_flush_us = s_flush_calls = s_flush_px = 0;
+        s_fl_swap_us = s_fl_addr_us = s_fl_queue_us = 0;
+      }
+      // Per-task-TYPE render time (accumulated inside lv_draw_sw.c's
+      // execute_drawing — LOCAL PATCH). Sums BOTH workers, so totals can exceed
+      // 10 s/window. This is the "where do the pixels actually cost" table.
+      {
+        extern uint32_t g_lv_draw_type_us[20], g_lv_draw_type_cnt[20];
+        static const char *dt_names[20] = {
+          "none", "fill", "border", "shadow", "letter", "label", "image",
+          "LAYER", "line", "arc", "tri", "maskrect", "maskbmp", "blur",
+          "vector", "3d", "g.look", "g.unpack", "g.blend", "?"
+        };
+        char db[192]; int dk = 0;
+        for (int i = 0; i < 20 && dk < (int)sizeof(db) - 24; i++) {
+          if (!g_lv_draw_type_cnt[i]) continue;
+          dk += snprintf(db + dk, sizeof(db) - dk, " %s %lums/%lu",
+                         dt_names[i],
+                         (unsigned long)(g_lv_draw_type_us[i] / 1000),
+                         (unsigned long)g_lv_draw_type_cnt[i]);
+          g_lv_draw_type_us[i] = g_lv_draw_type_cnt[i] = 0;
+        }
+        if (dk) USBSerial.printf("[draw]%s\n", db);
+      }
+      lp_win0 = ms; lp_passes = lp_fast = lp_drew = 0; lp_body_us = 0;
+    }
+  }
+#endif
+
+  delay(fast_pace ? 1 : 5);
 }

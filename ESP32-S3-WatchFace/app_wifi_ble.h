@@ -26,6 +26,7 @@ static void app_open_wifi_ble(void);   // fwd (rebuilt when BLE toggles, to refr
  * finishing pairing, which completes asynchronously on the BLE host task) so the
  * "Paired phones" list refreshes immediately instead of only on re-entry. */
 static lv_timer_t *s_wb_timer = nullptr;
+static int32_t     s_wb_scroll_y = 0;   // list scroll to restore after a forget-rebuild
 static void wb_rebuild_async(void *p) {
   (void)p;
   if (app_scr) { lv_obj_del(app_scr); app_scr = nullptr; }
@@ -37,9 +38,13 @@ static void wb_poll_cb(lv_timer_t *t) {
   // the timer so we never delete app_scr from inside its own callback chain.
   if (ble_take_bond_dirty()) lv_async_call(wb_rebuild_async, nullptr);
 }
+static lv_obj_t *s_wtxp_val;   // TX-power value labels (defined below) — nulled here
+static lv_obj_t *s_btxp_val;   // on screen teardown so they can never dangle
 static void wb_cleanup_cb(lv_event_t *e) {
   (void)e;
   if (s_wb_timer) { lv_timer_del(s_wb_timer); s_wb_timer = nullptr; }
+  s_wtxp_val = nullptr;
+  s_btxp_val = nullptr;
 }
 
 static void ble_sw_cb(lv_event_t *e) {
@@ -80,6 +85,74 @@ static void ble_sw_cb(lv_event_t *e) {
 
 /* settings_toggle_row() — the shared labelled-switch row — now lives in app_menu.h
  * so every settings screen (here, Power, Appearance) can use the same widget. */
+
+/* ----- Radio TX power rows (router-style range knob) -----
+ * One row per radio: icon + "WiFi TX"/"BLE TX" + a button showing the current
+ * tier ("Low 7dBm"). Tapping the button cycles Min -> ... -> Max -> Min; the
+ * setter persists and applies live (WiFi re-applies on each connect anyway).
+ * Value-label pointers are reassigned on every screen build and nulled on screen
+ * teardown (wb_cleanup_cb above, where they're declared). */
+
+static void wtxp_label_refresh(void) {
+  if (s_wtxp_val)
+    lv_label_set_text_fmt(s_wtxp_val, "%s %ddBm",
+                          RADIO_TXP_NAMES[settings_get_wifi_txp()],
+                          WIFI_TXP_DBM[settings_get_wifi_txp()]);
+}
+static void btxp_label_refresh(void) {
+  if (s_btxp_val)
+    lv_label_set_text_fmt(s_btxp_val, "%s %+ddBm",
+                          RADIO_TXP_NAMES[settings_get_ble_txp()],
+                          BLE_TXP_DBM[settings_get_ble_txp()]);
+}
+static void wtxp_cycle_cb(lv_event_t *e) {
+  (void)e;
+  settings_set_wifi_txp(settings_get_wifi_txp() + 1);   // setter wraps
+  wtxp_label_refresh();
+}
+static void btxp_cycle_cb(lv_event_t *e) {
+  (void)e;
+  settings_set_ble_txp(settings_get_ble_txp() + 1);
+  btxp_label_refresh();
+}
+
+/* Build one TX-power row; returns the value label (caller stores + refreshes). */
+static lv_obj_t *radio_txp_row(lv_obj_t *parent, const char *icon, const char *name,
+                               lv_event_cb_t cb) {
+  lv_obj_t *row = lv_obj_create(parent);
+  lv_obj_remove_style_all(row);
+  lv_obj_set_size(row, 320, 56);
+  lv_obj_set_style_bg_color(row, lv_color_hex(0x1A1A1A), 0);
+  lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+  lv_obj_set_style_radius(row, 14, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+
+  lv_obj_t *ic = lv_label_create(row);
+  lv_obj_set_style_text_font(ic, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_color(ic, lv_color_hex(ui_deco_hex(0x33A0FF)), 0);
+  lv_label_set_text(ic, icon);
+  lv_obj_align(ic, LV_ALIGN_LEFT_MID, 16, 0);
+
+  lv_obj_t *nm = lv_label_create(row);
+  lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(nm, lv_color_white(), 0);
+  lv_label_set_text(nm, name);
+  lv_obj_align(nm, LV_ALIGN_LEFT_MID, 50, 0);
+
+  lv_obj_t *btn = lv_btn_create(row);
+  lv_obj_set_size(btn, 138, 42);
+  lv_obj_align(btn, LV_ALIGN_RIGHT_MID, -8, 0);
+  lv_obj_set_style_bg_color(btn, lv_color_hex(0x2A2A2A), 0);
+  lv_obj_set_style_radius(btn, 12, 0);
+  lv_obj_set_style_shadow_width(btn, 0, 0);
+  lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, nullptr);
+
+  lv_obj_t *val = lv_label_create(btn);
+  lv_obj_set_style_text_font(val, &FONT_SMALL, 0);
+  lv_obj_set_style_text_color(val, lv_color_hex(ui_accent_hex()), 0);
+  lv_obj_center(val);
+  return val;
+}
 
 /* ----- Forget-network confirmation dialog -----
  * Forgetting a saved network is destructive, so it can't be a single misclick:
@@ -203,15 +276,24 @@ static void wifi_net_row(lv_obj_t *parent, uint8_t idx) {
  * re-pairing is low-stakes (just re-enter the code), unlike forgetting WiFi. */
 static void ble_forget_cb(lv_event_t *e) {
   int i = (int)(intptr_t)lv_event_get_user_data(e);
-  ble_bond_forget(i);
+  // btn -> row -> list: grab the list's scroll position so the success-rebuild
+  // doesn't jump back to the top of the screen.
+  lv_obj_t *btn  = (lv_obj_t *)lv_event_get_current_target(e);
+  lv_obj_t *list = lv_obj_get_parent(lv_obj_get_parent(btn));
+  if (!ble_bond_forget(i)) {              // failed: keep the screen as-is and say so
+    s_ble_toast = BLE_TOAST_FORGETFAIL;
+    return;
+  }
+  s_wb_scroll_y = lv_obj_get_scroll_y(list);
   if (app_scr) { lv_obj_del(app_scr); app_scr = nullptr; }
-  app_open_wifi_ble();                    // rebuild (same screen)
+  app_open_wifi_ble();                    // rebuild (same screen, same scroll)
 }
 
-/* One bonded-phone row: BLE icon + MAC address + a trash button to unpair. */
+/* One bonded-phone row: BLE icon + phone name (MAC until it has connected once
+ * since name capture shipped) + a trash button to unpair. */
 static void ble_paired_row(lv_obj_t *parent, int idx) {
-  char mac[18];
-  if (!ble_bond_addr_str(idx, mac, sizeof(mac))) return;
+  char label[32];
+  if (!ble_bond_label(idx, label, sizeof(label))) return;
 
   lv_obj_t *row = lv_obj_create(parent);
   lv_obj_remove_style_all(row);
@@ -230,7 +312,9 @@ static void ble_paired_row(lv_obj_t *parent, int idx) {
   lv_obj_t *nm = lv_label_create(row);
   lv_obj_set_style_text_font(nm, &FONT_SMALL, 0);
   lv_obj_set_style_text_color(nm, lv_color_white(), 0);
-  lv_label_set_text(nm, mac);
+  lv_label_set_text(nm, label);
+  lv_label_set_long_mode(nm, LV_LABEL_LONG_DOT);   // names can outgrow the row, MACs can't
+  lv_obj_set_width(nm, 210);
   lv_obj_align(nm, LV_ALIGN_LEFT_MID, 50, 0);
 
   lv_obj_t *del = lv_btn_create(row);
@@ -267,6 +351,12 @@ static void app_open_wifi_ble(void) {
                       wifi_sw_cb);
   settings_toggle_row(list, LV_SYMBOL_BLUETOOTH, "BLE", settings_get_ble_enabled(),
                       ble_sw_cb);
+
+  // Radio range (TX power): tap to cycle Min..Max. Lower = less power, less range.
+  s_wtxp_val = radio_txp_row(list, LV_SYMBOL_WIFI,      "WiFi TX", wtxp_cycle_cb);
+  wtxp_label_refresh();
+  s_btxp_val = radio_txp_row(list, LV_SYMBOL_BLUETOOTH, "BLE TX",  btxp_cycle_cb);
+  btxp_label_refresh();
 
   // Hint: WiFi off = no fetches; BLE on = pair a phone (it shows a code to enter)
   // to send WiFi credentials, which save to the SD card first, flash as fallback.
@@ -324,6 +414,11 @@ static void app_open_wifi_ble(void) {
       for (int i = 0; i < bn; i++) ble_paired_row(list, i);
     }
   }
+
+  // Restore the scroll position a forget-rebuild stashed (0 = normal entry, top).
+  // LVGL clamps an out-of-range offset, so a now-shorter list is safe.
+  lv_obj_scroll_to_y(list, s_wb_scroll_y, LV_ANIM_OFF);
+  s_wb_scroll_y = 0;
 
   // Watch for an async pairing completing while this screen is up, so a newly-paired
   // phone appears without leaving + re-entering. Recreated on each (re)build; torn

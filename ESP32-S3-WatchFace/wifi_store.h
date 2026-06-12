@@ -25,6 +25,7 @@
  * ========================================================================== */
 #pragma once
 #include <Arduino.h>
+#include "esp_heap_caps.h"   // heap_caps_calloc — the network list lives in PSRAM
 #include "sd_card.h"
 #include "storage_fs.h"
 
@@ -39,9 +40,20 @@ struct WifiNet {
   char ssid[WIFI_SSID_MAX];
   char pass[WIFI_PASS_MAX];
 };
-static WifiNet s_wifi_nets[WIFI_NET_CAP];
+/* The list lives in PSRAM, not static SRAM (~3 KB of .bss freed for the display's
+ * partial render buffers). Allocated on first use; s_wifi_net_count stays 0 until
+ * the alloc succeeds, so the count-guarded loops below never deref a NULL list. */
+static WifiNet *s_wifi_nets = nullptr;     // [WIFI_NET_CAP]
 static uint8_t s_wifi_net_count = 0;
 static bool    s_wifi_sd        = false;   // true when the CSV backend (SD or FFat) is live
+static bool wifi_nets_buf_ok(void) {
+  if (!s_wifi_nets)
+    s_wifi_nets = (WifiNet *)heap_caps_calloc(WIFI_NET_CAP, sizeof(WifiNet),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!s_wifi_nets)  // PSRAM missing/full (shouldn't happen) -> internal heap so WiFi still works
+    s_wifi_nets = (WifiNet *)calloc(WIFI_NET_CAP, sizeof(WifiNet));
+  return s_wifi_nets != nullptr;
+}
 
 /* ---- low-level: copy strings into a slot (always NUL-terminated) ---- */
 static void wifi_net_set(WifiNet &n, const char *ssid, const char *pass) {
@@ -51,6 +63,7 @@ static void wifi_net_set(WifiNet &n, const char *ssid, const char *pass) {
 
 /* ---- flash (NVS) backing — the no-card fallback, capped at WIFI_NET_MAX ---- */
 static void wifi_flash_save(void) {
+  if (!wifi_nets_buf_ok()) return;   // never hand NVS a NULL blob pointer
   uint8_t cnt = s_wifi_net_count > WIFI_NET_MAX ? WIFI_NET_MAX : s_wifi_net_count;
   prefs.putUChar("wifiver", WIFI_NET_SCHEMA);
   prefs.putBytes("wifinets", s_wifi_nets, sizeof(WifiNet) * cnt);
@@ -58,6 +71,7 @@ static void wifi_flash_save(void) {
 }
 
 static void wifi_flash_load(void) {
+  if (!wifi_nets_buf_ok()) { s_wifi_net_count = 0; return; }
   // Schema guard: NVS survives a reflash, so reject a list from a different layout.
   if (prefs.getUChar("wifiver", 0) != WIFI_NET_SCHEMA) {
     prefs.remove("wifinets");
@@ -95,6 +109,7 @@ static bool wifi_csv_save(void) {
 /* Read /wifi.csv into the list. Returns the count loaded, or -1 if the file is
  * missing/unreadable (caller then falls back to flash). */
 static int wifi_csv_load(void) {
+  if (!wifi_nets_buf_ok()) return -1;
   if (!store_available() || !store_fs().exists(WIFI_CSV_PATH)) return -1;
   File f = store_fs().open(WIFI_CSV_PATH, FILE_READ);
   if (!f) return -1;
@@ -129,7 +144,7 @@ static void wifi_nets_save(void) {
  * added. The cap is the SD cap when card-backed, else the flash cap. Caller
  * persists via wifi_nets_save(). */
 static bool wifi_nets_add(const char *ssid, const char *pass) {
-  if (!ssid || !ssid[0]) return false;
+  if (!ssid || !ssid[0] || !wifi_nets_buf_ok()) return false;
   for (uint8_t i = 0; i < s_wifi_net_count; i++)
     if (strncmp(s_wifi_nets[i].ssid, ssid, WIFI_SSID_MAX) == 0) return false;
   uint8_t cap = s_wifi_sd ? WIFI_NET_CAP : WIFI_NET_MAX;

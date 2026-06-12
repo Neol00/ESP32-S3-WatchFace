@@ -75,6 +75,83 @@ const lv_font_class_t lv_builtin_font_class = {
     .free_src_cb = builtin_font_free_src_cb,
 };
 
+/* ESP32-S3-WatchFace LOCAL PATCH: decoded-glyph cache.
+ * The [draw] profiler showed the 4bpp->A8 unpack below at ~49 µs/glyph, run
+ * 63k times per 10 s of scrolling — 45% of ALL label render time — while the
+ * UI only uses a few hundred DISTINCT glyphs. Cache the unpacked A8 bitmaps
+ * (direct-mapped on (font, gid)) and serve repeats as a memcpy (~3 µs).
+ * Entries live in lv_malloc (PSRAM) — the copy-out streams sequentially, which
+ * the PSRAM cache handles well. Mutex-guarded: BOTH SW render workers fetch
+ * glyphs concurrently. Disabled (transparent fallthrough to the unpack) until
+ * lv_font_fmt_txt_glyph_cache_init() is called single-threaded from setup(). */
+#include "../../osal/lv_os.h"
+#include "../../stdlib/lv_mem.h"
+#include "../../stdlib/lv_string.h"
+#define WATCH_GCACHE_ENTRIES 512        /* power of 2; ~10 KB table in PSRAM */
+#define WATCH_GCACHE_MAX_BYTES 8192     /* don't cache giant glyphs */
+typedef struct {
+    const void * font;
+    uint32_t gid;
+    uint32_t bytes;
+    uint32_t cap;
+    uint8_t * data;
+} watch_gcache_entry_t;
+static watch_gcache_entry_t * watch_gcache;
+static lv_mutex_t watch_gcache_mtx;
+static volatile int watch_gcache_on;
+
+void lv_font_fmt_txt_glyph_cache_init(void)
+{
+    if(watch_gcache_on) return;
+    watch_gcache = lv_malloc_zeroed(sizeof(watch_gcache_entry_t) * WATCH_GCACHE_ENTRIES);
+    if(watch_gcache == NULL) return;
+    lv_mutex_init(&watch_gcache_mtx);
+    watch_gcache_on = 1;
+}
+
+static watch_gcache_entry_t * watch_gcache_slot(const void * font, uint32_t gid)
+{
+    uint32_t h = ((uint32_t)(uintptr_t)font >> 4) ^ (gid * 2654435761u);
+    return &watch_gcache[h & (WATCH_GCACHE_ENTRIES - 1)];
+}
+
+static bool watch_gcache_get(const void * font, uint32_t gid, uint8_t * dst, uint32_t bytes)
+{
+    if(!watch_gcache_on || bytes > WATCH_GCACHE_MAX_BYTES) return false;
+    watch_gcache_entry_t * e = watch_gcache_slot(font, gid);
+    bool hit = false;
+    lv_mutex_lock(&watch_gcache_mtx);
+    if(e->font == font && e->gid == gid && e->bytes == bytes && e->data != NULL) {
+        lv_memcpy(dst, e->data, bytes);
+        hit = true;
+    }
+    lv_mutex_unlock(&watch_gcache_mtx);
+    return hit;
+}
+
+static void watch_gcache_put(const void * font, uint32_t gid, const uint8_t * src, uint32_t bytes)
+{
+    if(!watch_gcache_on || bytes > WATCH_GCACHE_MAX_BYTES) return;
+    watch_gcache_entry_t * e = watch_gcache_slot(font, gid);
+    lv_mutex_lock(&watch_gcache_mtx);
+    if(e->cap < bytes) {
+        lv_free(e->data);
+        e->data = lv_malloc(bytes);
+        e->cap = (e->data != NULL) ? bytes : 0;
+    }
+    if(e->data != NULL) {
+        lv_memcpy(e->data, src, bytes);
+        e->font = font;
+        e->gid = gid;
+        e->bytes = bytes;
+    }
+    else {
+        e->font = NULL; /* alloc failed: poison the slot, keep running uncached */
+        e->cap = 0;
+    }
+    lv_mutex_unlock(&watch_gcache_mtx);
+}
+
 /**********************
  * GLOBAL PROTOTYPES
  **********************/
@@ -112,6 +189,13 @@ const void * lv_font_get_bitmap_fmt_txt(lv_font_glyph_dsc_t * g_dsc, lv_draw_buf
         int32_t i = 0;
         int32_t x, y;
         uint32_t stride_out = lv_draw_buf_width_to_stride(gdsc->box_w, LV_COLOR_FORMAT_A8);
+
+        /* LOCAL PATCH: serve repeat glyphs from the decoded cache (see above) */
+        uint32_t watch_bytes = stride_out * gdsc->box_h;
+        if(watch_gcache_get(font, gid, bitmap_out, watch_bytes)) {
+            lv_draw_buf_flush_cache(draw_buf, NULL);
+            return draw_buf;
+        }
         if(fdsc->bpp == 1) {
             for(y = 0; y < gdsc->box_h; y ++) {
                 uint16_t line_rem = stride_in != 0 ? stride_in : gdsc->box_w;
@@ -197,6 +281,9 @@ const void * lv_font_get_bitmap_fmt_txt(lv_font_glyph_dsc_t * g_dsc, lv_draw_buf
                 bitmap_in += line_rem;
             }
         }
+
+        /* LOCAL PATCH: remember the freshly unpacked glyph for next time */
+        watch_gcache_put(font, gid, bitmap_out, watch_bytes);
 
         lv_draw_buf_flush_cache(draw_buf, NULL);
         return draw_buf;

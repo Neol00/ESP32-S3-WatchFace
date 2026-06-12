@@ -169,7 +169,18 @@ static void LV_ATTRIBUTE_FAST_MEM draw_letter_cb(lv_draw_task_t * t, lv_draw_gly
                             lv_draw_sw_blend(t, &blend_dsc);
                         }
                         else {
+                            /* ESP32-S3-WatchFace LOCAL PATCH: split label time into glyph
+                             * fetch/unpack (slot 17) vs mask blend (slot 18). Both are
+                             * SUBSETS of the [draw] "label" total. Counters defined in
+                             * lv_draw_sw.c; esp_timer.h comes via lv_draw_sw.h includes. */
+                            extern uint32_t g_lv_draw_type_us[20];
+                            extern uint32_t g_lv_draw_type_cnt[20];
+                            extern int64_t esp_timer_get_time(void);
+                            uint32_t watch_t0 = (uint32_t)esp_timer_get_time();
                             glyph_draw_dsc->glyph_data = lv_font_get_glyph_bitmap(glyph_draw_dsc->g, glyph_draw_dsc->_draw_buf);
+                            uint32_t watch_t1 = (uint32_t)esp_timer_get_time();
+                            g_lv_draw_type_us[17] += watch_t1 - watch_t0;
+                            g_lv_draw_type_cnt[17]++;
                             if(glyph_draw_dsc->glyph_data == NULL) {
                                 LV_LOG_WARN("Couldn't get the bitmap of a glyph");
                                 break;
@@ -187,6 +198,8 @@ static void LV_ATTRIBUTE_FAST_MEM draw_letter_cb(lv_draw_task_t * t, lv_draw_gly
                             blend_dsc.blend_area = glyph_draw_dsc->letter_coords;
                             blend_dsc.mask_res = LV_DRAW_SW_MASK_RES_CHANGED;
                             lv_draw_sw_blend(t, &blend_dsc);
+                            g_lv_draw_type_us[18] += (uint32_t)esp_timer_get_time() - watch_t1;
+                            g_lv_draw_type_cnt[18]++;
                         }
                     }
                     else {

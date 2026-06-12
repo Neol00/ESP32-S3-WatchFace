@@ -1,0 +1,29 @@
+--- a/cores/esp32/Esp.cpp
++++ b/cores/esp32/Esp.cpp
+@@ -36,6 +36,9 @@
+ #include "esp_chip_info.h"
+ #include "esp_mac.h"
+ #include "esp_flash.h"
++#ifdef CONFIG_SPIRAM
++#include "esp_psram.h"  // LOCAL PATCH (ESP32-S3-WatchFace): physical PSRAM size
++#endif
+ 
+ // Include HAL layer for flash clock access
+ #include "hal/spi_flash_ll.h"
+@@ -174,7 +177,16 @@
+ 
+ uint32_t EspClass::getPsramSize(void) {
+   if (psramFound()) {
++#ifdef CONFIG_SPIRAM
++    // LOCAL PATCH (ESP32-S3-WatchFace): report the PHYSICAL chip size, not the heap
++    // total. With XIP-from-PSRAM (required by 120 MHz DDR octal PSRAM) ~2 MB of app
++    // code+rodata is copied into PSRAM BEFORE the heap is created, so the heap total
++    // made the 8 MB chip read as "6 MB". esp_psram_get_size() is the detected chip
++    // size, independent of what boot-time features reserved.
++    return esp_psram_get_size();
++#else
+     return heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
++#endif
+   }
+   return 0;
+ }

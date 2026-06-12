@@ -50,7 +50,10 @@ bool Arduino_ESP32QSPI::begin(int32_t speed, int8_t dataMode)
         .data5_io_num = -1,
         .data6_io_num = -1,
         .data7_io_num = -1,
-        .max_transfer_sz = (ESP32QSPI_MAX_PIXELS_AT_ONCE * 16) + 8,
+        // LOCAL PATCH (ESP32-S3-WatchFace): was (MAX_PIXELS_AT_ONCE*16)+8. The async
+        // tile write queues 32 KB segments (SPI hw max is 2^18 bits/transaction), so
+        // the driver must size its DMA descriptors for that.
+        .max_transfer_sz = 32768 + 8,
         .flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_GPIO_PINS,
 #if (!defined(ESP_ARDUINO_VERSION_MAJOR)) || (ESP_ARDUINO_VERSION_MAJOR < 3)
     // skip this
@@ -82,10 +85,13 @@ bool Arduino_ESP32QSPI::begin(int32_t speed, int8_t dataMode)
       .spics_io_num = -1, // avoid use system CS control
       .flags = SPI_DEVICE_HALFDUPLEX,
       // LOCAL PATCH (ESP32-S3-WatchFace): 1 -> 2 so writePixels() can keep one DMA
-      // transaction in flight while the CPU converts the next chunk (pipelined flush).
-      .queue_size = 2,
-      .pre_cb = nullptr,
-      .post_cb = nullptr};
+      // transaction in flight while the CPU converts the next chunk (pipelined flush);
+      // -> 6 so writePixelsBeAsync() can queue up to ASYNC_MAX_SEG tile segments.
+      .queue_size = 6,
+      // LOCAL PATCH (ESP32-S3-WatchFace): CS + completion for the async tile write.
+      // No-ops for every transaction whose .user is NULL (all the sync paths).
+      .pre_cb = Arduino_ESP32QSPI::_async_pre_cb,
+      .post_cb = Arduino_ESP32QSPI::_async_post_cb};
   esp_err_t ret = spi_bus_add_device(ESP32QSPI_SPI_HOST, &devcfg, &_handle);
   if (ret != ESP_OK)
   {
@@ -417,6 +423,113 @@ void Arduino_ESP32QSPI::writePixels(uint16_t *data, uint32_t len)
   CS_HIGH();
 }
 
+// LOCAL PATCH (ESP32-S3-WatchFace): ASYNC tile write — see header. Unlike
+// writePixels() above there is NO per-chunk CPU work at all: the buffer is already
+// in panel byte order, so the whole area goes out as <=ASYNC_MAX_SEG large queued
+// DMA transactions and this returns as soon as they're queued (~µs). The caller's
+// CPU time is then free (LVGL renders the next tile) while the wire drains.
+// CS and the completion callback are driven from _async_pre_cb/_async_post_cb.
+bool Arduino_ESP32QSPI::writePixelsBeAsync(const uint8_t *data, uint32_t len, void (*done_cb)(void *), void *done_arg)
+{
+  // 32760 = largest multiple of 4 bytes under the 2^18-bit hw transaction cap.
+  const uint32_t SEG = 32760;
+  if (!len)
+  {
+    if (done_cb)
+    {
+      done_cb(done_arg);
+    }
+    return true;
+  }
+  uint32_t nseg = (len + SEG - 1) / SEG;
+  if (nseg > (uint32_t)ASYNC_MAX_SEG)
+  {
+    return false; // too big for one bracket — caller uses the sync path
+  }
+
+  waitAsync(); // only one async write may be in flight
+  _async_done_cb = done_cb;
+  _async_done_arg = done_arg;
+
+  for (uint32_t i = 0; i < nseg; i++)
+  {
+    spi_transaction_ext_t *t = &_async_tran[i];
+    AsyncSeg *s = &_async_seg[i];
+    s->bus = this;
+    s->first = (i == 0);
+    s->last = (i == nseg - 1);
+
+    uint32_t off = i * SEG;
+    uint32_t l = len - off;
+    if (l > SEG)
+    {
+      l = SEG;
+    }
+
+    memset(t, 0, sizeof(*t));
+    if (i == 0)
+    {
+      // first segment carries the write-continue command, like writePixels()
+      t->base.flags = SPI_TRANS_MODE_QIO;
+      t->base.cmd = 0x32;
+      t->base.addr = 0x003C00;
+    }
+    else
+    {
+      t->base.flags = SPI_TRANS_MODE_QIO | SPI_TRANS_VARIABLE_CMD |
+                      SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_VARIABLE_DUMMY;
+    }
+    t->base.tx_buffer = data + off;
+    t->base.length = l << 3;
+    t->base.user = s;
+
+    if (spi_device_queue_trans(_handle, (spi_transaction_t *)t, portMAX_DELAY) != ESP_OK)
+    {
+      waitAsync(); // reap whatever did queue, leave the bus clean
+      return false;
+    }
+    _async_pending++;
+  }
+  return true;
+}
+
+void Arduino_ESP32QSPI::waitAsync()
+{
+  while (_async_pending)
+  {
+    spi_transaction_t *done;
+    spi_device_get_trans_result(_handle, &done, portMAX_DELAY);
+    _async_pending--;
+  }
+}
+
+// Both callbacks run in the SPI interrupt for EVERY transaction on this device;
+// sync transactions have .user == NULL and fall straight through. CS is written
+// via the raw port registers (NOT CS_LOW/CS_HIGH — CS_LOW drains the async queue
+// and must never run inside this ISR).
+void Arduino_ESP32QSPI::_async_pre_cb(spi_transaction_t *t)
+{
+  AsyncSeg *s = (AsyncSeg *)t->user;
+  if (s && s->first)
+  {
+    *(s->bus->_csPortClr) = s->bus->_csPinMask;
+  }
+}
+
+void Arduino_ESP32QSPI::_async_post_cb(spi_transaction_t *t)
+{
+  AsyncSeg *s = (AsyncSeg *)t->user;
+  if (s && s->last)
+  {
+    Arduino_ESP32QSPI *b = s->bus;
+    *(b->_csPortSet) = b->_csPinMask;
+    if (b->_async_done_cb)
+    {
+      b->_async_done_cb(b->_async_done_arg);
+    }
+  }
+}
+
 void Arduino_ESP32QSPI::batchOperation(const uint8_t *operations, size_t len)
 {
   for (size_t i = 0; i < len; ++i)
@@ -735,6 +848,10 @@ GFX_INLINE void Arduino_ESP32QSPI::CS_HIGH(void)
 
 GFX_INLINE void Arduino_ESP32QSPI::CS_LOW(void)
 {
+  // LOCAL PATCH (ESP32-S3-WatchFace): every sync bus operation starts with CS_LOW,
+  // so this is the single choke point that keeps commands (addr window, brightness,
+  // sleep) from interleaving with an in-flight async tile write.
+  waitAsync();
   *_csPortClr = _csPinMask;
 }
 

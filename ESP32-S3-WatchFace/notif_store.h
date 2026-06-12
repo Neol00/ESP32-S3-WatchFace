@@ -219,7 +219,7 @@ static NotifCat notif_cat_from_appid(const char *appid) {
   if (M("battery") || M("charging") || M("charge") || M("power") || M("lowpower") ||
       M("energy"))                                            return NCAT_POWER;
   if (M("thermostat") || M("nest") || M("temperature") || M("ecobee") ||
-      M("thermometer"))                                       return NCAT_TEMP;
+      M("thermometer") || M("Temp"))                         return NCAT_TEMP;
   if (M("printer") || M("airprint") || M("hpsmart") || M("hp smart") || M("epson") ||
       M("canon print"))                                       return NCAT_PRINTER;
   if (M("usb") || M("thumbdrive") || M("flashdrive"))         return NCAT_USB;
@@ -309,8 +309,22 @@ struct NotifEntry {
   char title[NOTIF_TITLE_MAX];
   char body[NOTIF_BODY_MAX];
 };
-static NotifEntry s_notifs[NOTIF_STORE_MAX];  // [0] = newest
-static uint8_t    s_notif_count = 0;
+#include "esp_heap_caps.h"   // heap_caps_calloc — the list lives in PSRAM
+
+/* The entry list lives in PSRAM, not static SRAM (~10 KB of .bss freed for the
+ * display's partial render buffers). Allocated on first use; s_notif_count stays
+ * 0 until the alloc succeeds, so every count-guarded loop/index below is safe
+ * even while the pointer is still NULL. */
+static NotifEntry *s_notifs = nullptr;       // [NOTIF_STORE_MAX], [0] = newest
+static uint8_t     s_notif_count = 0;
+static bool notif_store_buf_ok(void) {
+  if (!s_notifs)
+    s_notifs = (NotifEntry *)heap_caps_calloc(NOTIF_STORE_MAX, sizeof(NotifEntry),
+                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!s_notifs)  // PSRAM missing/full (shouldn't happen) -> internal heap so notifs still work
+    s_notifs = (NotifEntry *)calloc(NOTIF_STORE_MAX, sizeof(NotifEntry));
+  return s_notifs != nullptr;
+}
 
 /* Schema version for the persisted NotifEntry layout. NVS SURVIVES a firmware
  * re-flash, so a new build can read a blob written by an OLD build whose
@@ -325,11 +339,13 @@ static uint8_t    s_notif_count = 0;
 /* Persist the whole list as one NVS blob under namespace "watch", key "notlist".
  * One blob = one write per change, regardless of list length. */
 static void notif_store_save(void) {
+  if (!notif_store_buf_ok()) return;   // never hand NVS a NULL blob pointer
   prefs.putUChar("notver", NOTIF_SCHEMA_VER);
   prefs.putBytes("notlist", s_notifs, sizeof(NotifEntry) * s_notif_count);
   prefs.putUChar("notcnt", s_notif_count);
 }
 static void notif_store_load(void) {
+  if (!notif_store_buf_ok()) { s_notif_count = 0; return; }
   // Reject a store written by a different NotifEntry layout (or a pre-version
   // build, where the key is absent -> 0). Wipe it so we start clean rather than
   // deserializing an incompatible/garbage blob.
@@ -365,6 +381,7 @@ static void notif_store_load(void) {
  * you want to keep.) */
 static bool notif_store_add(uint64_t id, const char *title, const char *body,
                             uint8_t cat = NCAT_GENERIC) {
+  if (!notif_store_buf_ok()) return false;
   for (uint8_t i = 0; i < s_notif_count; i++)                // de-dup by id
     if (s_notifs[i].id == id) return false;
   // Full -> drop the oldest (last) so the incoming newest can take index 0.

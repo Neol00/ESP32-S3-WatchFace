@@ -36,6 +36,8 @@
 #include <BLEServer.h>
 #include <BLESecurity.h>
 #include <host/ble_store.h>   // ble_store_util_bonded_peers() — list bonded phones (NimBLE)
+#include <services/gatt/ble_svc_gatt.h>   // ble_svc_gatt_changed() — Service Changed indication
+#include <host/ble_hs.h>                  // ble_gattc_read_by_uuid() — peer Device Name read
 
 /* ANCS client (ble_ancs.h) is included LATER in the .ino — after the notification
  * store/net headers it depends on — so we only forward-declare the two entry points
@@ -46,11 +48,48 @@ static void ams_reset(void);
 static void ancs_reset(void);
 static void ancs_install_gap_handler(void);
 
+/* Gadgetbridge/Android server (ble_gadgetbridge.h) is also included LATER in the
+ * .ino (after the notification store it feeds) — same forward-declare pattern. */
+static void gb_rx_bytes(const uint8_t *data, uint16_t len);
+static void gb_reset(void);
+static void gb_set_tx(BLECharacteristic *tx);
+static bool gb_send(const char *json);
+
 /* Custom 128-bit UUIDs (random; keep in sync with the phone app). */
 #define BLE_SVC_UUID       "6b1f0001-9a3e-4c7a-9b2d-2f1a8c5e7d10"
 #define BLE_PROV_UUID      "6b1f0002-9a3e-4c7a-9b2d-2f1a8c5e7d10"   // WiFi provision (write, encrypted)
 #define BLE_FIND_UUID      "6b1f0003-9a3e-4c7a-9b2d-2f1a8c5e7d10"   // find-phone (notify, watch→phone)
 #define BLE_FINDWATCH_UUID "6b1f0004-9a3e-4c7a-9b2d-2f1a8c5e7d10"   // find-watch (write, phone→watch)
+
+/* GATT SCHEMA VERSION — BUMP THIS whenever the server's attribute table changes
+ * (a service/characteristic/descriptor added, removed, or reordered). iOS and
+ * Android both CACHE the GATT database of a BONDED peripheral and keep writing to
+ * the OLD handles after a reflash unless told otherwise — writes then land on
+ * whichever characteristic now occupies that handle (e.g. a find-watch "RING"
+ * write hitting the WiFi-provision characteristic, or a CCCD re-subscribe hitting
+ * find-watch and sounding the alarm on connect). On the first encrypted connect
+ * from a peer whose recorded version differs, we indicate the standard GATT
+ * Service Changed characteristic (range 1..0xFFFF) so the phone drops its cache
+ * and re-discovers. Version 2 = NUS (Gadgetbridge) + Battery Service added. */
+#define BLE_GATT_SCHEMA_VER 2
+
+/* Indicate Service Changed to this peer if our attribute table changed since it
+ * last connected (tracked per bonded identity address in NVS). NimBLE host task. */
+static void ble_svc_changed_check(const ble_gap_conn_desc *desc) {
+  const uint8_t *a = desc->peer_id_addr.val;     // identity addr: stable across RPA rotation
+  char key[16];                                  // NVS keys are capped at 15 chars
+  snprintf(key, sizeof(key), "gv%02x%02x%02x%02x%02x%02x", a[5], a[4], a[3], a[2], a[1], a[0]);
+  if (prefs.getUChar(key, 0) == BLE_GATT_SCHEMA_VER) return;
+  ble_svc_gatt_changed(0x0001, 0xFFFF);          // indication to subscribed (bonded) peers
+  prefs.putUChar(key, BLE_GATT_SCHEMA_VER);
+  USBSerial.printf("[ble] GATT table changed since %s last connected -> Service Changed indicated\n", key + 2);
+}
+
+/* Nordic UART Service — the Bangle.js/Gadgetbridge transport (Android notifications).
+ * Standard NUS UUIDs; Gadgetbridge writes JSON lines to RX, we notify replies on TX. */
+#define BLE_NUS_SVC_UUID  "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define BLE_NUS_RX_UUID   "6e400002-b5a3-f393-e0a9-e50e24dcca9e"   // phone→watch (write / write-no-rsp)
+#define BLE_NUS_TX_UUID   "6e400003-b5a3-f393-e0a9-e50e24dcca9e"   // watch→phone (notify)
 
 /* ---- state (some written from the NimBLE task, read by the loop) ---- */
 static bool                 s_ble_up        = false;   // stack initialized + advertising
@@ -59,12 +98,14 @@ static volatile bool        s_ble_show_key  = false;   // show the pair code ove
 static volatile uint32_t    s_ble_passkey   = 0;       // 6-digit code to display
 static BLEServer           *s_ble_server     = nullptr;
 static BLECharacteristic   *s_ble_find_ch    = nullptr;
+static BLECharacteristic   *s_ble_batt_ch    = nullptr;   // standard Battery Level (0x2A19)
 static lv_obj_t            *s_ble_key_box    = nullptr; // LVGL overlay (loop thread only)
 static volatile bool        s_ble_findwatch_req = false; // phone wrote find-watch -> ring (loop consumes)
 
 /* Result toast: set by a NimBLE callback, shown by the loop. PAIRED fires once when
  * a phone finishes pairing; SAVED/DUP/FULL report a WiFi-provisioning write. */
-enum BleToast { BLE_TOAST_NONE = 0, BLE_TOAST_PAIRED, BLE_TOAST_SAVED, BLE_TOAST_DUP, BLE_TOAST_FULL };
+enum BleToast { BLE_TOAST_NONE = 0, BLE_TOAST_PAIRED, BLE_TOAST_SAVED, BLE_TOAST_DUP, BLE_TOAST_FULL,
+                BLE_TOAST_FORGETFAIL };   // bond delete failed (shown instead of rebuilding the list)
 static volatile BleToast    s_ble_toast      = BLE_TOAST_NONE;
 static volatile bool        s_ble_pairing    = false;   // a passkey was shown -> this is a real pairing (not a bonded reconnect)
 static char                 s_ble_toast_ssid[WIFI_SSID_MAX] = "";
@@ -72,6 +113,47 @@ static lv_obj_t            *s_ble_toast_box  = nullptr;   // loop thread only
 static uint32_t             s_ble_toast_until = 0;
 static volatile bool        s_ble_dirty      = false;     // one-shot: repaint when an overlay appears/clears
 static volatile bool        s_ble_bond_dirty = false;     // one-shot: a bond was added/removed (refresh the paired list)
+
+/* ---- peer device-name capture ----
+ * The bond store only holds addresses, but every phone serves the standard GAP
+ * Device Name characteristic (0x2A00) — e.g. "Noel's iPhone". We read it once per
+ * connection right after the link encrypts and cache it in NVS keyed by the peer's
+ * identity address ("bn"+mac), so the Paired-phones list can show a name instead of
+ * a MAC (and still can while that phone is disconnected). Single s_name_key is fine:
+ * the server holds ONE connection at a time. NimBLE allows only one GATT procedure
+ * per connection, so this read runs FIRST and chains into ANCS discovery (which in
+ * turn chains AMS) from its completion callback. */
+static char s_name_key[16] = "";   // NVS key of the peer whose name read is in flight
+
+static int ble_name_read_cb(uint16_t conn, const struct ble_gatt_error *err,
+                            struct ble_gatt_attr *attr, void *arg) {
+  (void)arg;
+  if (err && err->status == 0 && attr && attr->om) {
+    char name[32];
+    uint16_t len = OS_MBUF_PKTLEN(attr->om);
+    if (len > sizeof(name) - 1) len = sizeof(name) - 1;
+    if (len && os_mbuf_copydata(attr->om, 0, len, name) == 0) {
+      name[len] = '\0';
+      prefs.putString(s_name_key, name);
+      s_ble_bond_dirty = true;     // an open Paired-phones list re-labels itself
+      USBSerial.printf("[ble] peer name \"%s\"\n", name);
+    }
+    return 0;                      // not terminal — EDONE still follows
+  }
+  // Terminal (EDONE or error): the GATT pipe is free — hand it to ANCS discovery.
+  ancs_on_encrypted(conn);
+  return 0;
+}
+
+static void ble_peer_name_fetch(const ble_gap_conn_desc *desc) {
+  const uint8_t *a = desc->peer_id_addr.val;
+  snprintf(s_name_key, sizeof(s_name_key), "bn%02x%02x%02x%02x%02x%02x",
+           a[5], a[4], a[3], a[2], a[1], a[0]);
+  static const ble_uuid16_t NAME_UUID = BLE_UUID16_INIT(0x2A00);
+  int rc = ble_gattc_read_by_uuid(desc->conn_handle, 0x0001, 0xFFFF, &NAME_UUID.u,
+                                  ble_name_read_cb, NULL);
+  if (rc != 0) ancs_on_encrypted(desc->conn_handle);   // can't read -> straight to ANCS
+}
 
 /* ----------------------------- callbacks --------------------------------- */
 
@@ -84,6 +166,7 @@ class BleServerCB : public BLEServerCallbacks {
     s_ble_show_key  = false;                  // drop any stale pair-code overlay
     ancs_reset();                             // forget discovered ANCS handles for this conn
     ams_reset();                              // ...and AMS (media) handles
+    gb_reset();                               // ...and any half-received Gadgetbridge line
     if (s_ble_up) BLEDevice::startAdvertising();
   }
 };
@@ -109,11 +192,13 @@ class BleSecurityCB : public BLESecurityCallbacks {
     }
     s_ble_pairing = false;
     USBSerial.printf("[ble] auth %s\n", ok ? "OK (encrypted/bonded)" : "FAILED");
-    // Link is now encrypted+bonded — the prerequisite for ANCS. Kick off discovery
-    // of the iPhone's notification service over this same connection.
-    // ANCS discovery runs first; it chains into AMS discovery when done (NimBLE
-    // allows only one GATT procedure per connection at a time, so they must serialize).
-    if (ok && desc) ancs_on_encrypted(desc->conn_handle);
+    // If the GATT table changed since this peer last connected (reflash that added/
+    // moved services), tell it to drop its cached handles BEFORE it acts on them.
+    if (ok && desc) ble_svc_changed_check(desc);
+    // Link is now encrypted+bonded — the prerequisite for ANCS. GATT procedures
+    // serialize per connection, so this is a chain: read the peer's Device Name
+    // (for the Paired-phones list), then ANCS discovery, then AMS.
+    if (ok && desc) ble_peer_name_fetch(desc);
   }
 };
 
@@ -155,11 +240,21 @@ class BleFindWatchCB : public BLECharacteristicCallbacks {
   }
 };
 
+/* Gadgetbridge NUS RX (phone → watch): JSON lines, chunked at the ATT MTU. Runs on
+ * the NimBLE task; gb_rx_bytes reassembles + parses and only flags the loop. */
+class BleGbRxCB : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *ch) override {
+    String v = ch->getValue();
+    if (v.length()) gb_rx_bytes((const uint8_t *)v.c_str(), (uint16_t)v.length());
+  }
+};
+
 /* Callback singletons (not new'd per begin) so toggling BLE never leaks. */
 static BleServerCB    s_cb_server;
 static BleSecurityCB  s_cb_security;
 static BleProvCB      s_cb_prov;
 static BleFindWatchCB s_cb_findwatch;
+static BleGbRxCB      s_cb_gb_rx;
 
 /* ----------------------------- public API -------------------------------- */
 
@@ -186,6 +281,7 @@ static void ble_begin(void) {
   if (s_ble_up) return;
 
   BLEDevice::init(DEVICE_NAME);
+  settings_apply_ble_txp();     // user's TX-power tier (controller resets it on init)
   BLEDevice::setSecurityCallbacks(&s_cb_security);
   ancs_install_gap_handler();   // observe inbound ANCS notifications (no core patch needed)
 
@@ -225,6 +321,35 @@ static void ble_begin(void) {
   fw->setCallbacks(&s_cb_findwatch);
 
   svc->start();
+
+  // Nordic UART Service for Gadgetbridge (Android notifications, Bangle.js protocol).
+  // Plain (unencrypted) writes for now: Gadgetbridge's Bangle.js transport uses
+  // write-without-response, which an enc/authen requirement would SILENTLY drop
+  // instead of triggering pairing. Hardening to an encrypted link is a follow-up
+  // (enable "bond" in Gadgetbridge's device settings, then add WRITE_ENC here).
+  BLEService *nus = s_ble_server->createService(BLE_NUS_SVC_UUID);
+  BLECharacteristic *nusRx = nus->createCharacteristic(
+      BLE_NUS_RX_UUID,
+      BLECharacteristic::PROPERTY_WRITE |
+      BLECharacteristic::PROPERTY_WRITE_NR);
+  nusRx->setCallbacks(&s_cb_gb_rx);
+  BLECharacteristic *nusTx = nus->createCharacteristic(
+      BLE_NUS_TX_UUID, BLECharacteristic::PROPERTY_NOTIFY);
+  gb_set_tx(nusTx);
+  nus->start();
+
+  // Standard Battery Service (0x180F / 0x2A19). iOS reads+subscribes to this on any
+  // connected accessory and shows the watch in the iPhone's Batteries widget — this
+  // is the iPhone-side battery report (ANCS itself can't carry battery). Value is
+  // pushed by ble_report_battery() from the loop's PMU refresh.
+  BLEService *bas = s_ble_server->createService(BLEUUID((uint16_t)0x180F));
+  s_ble_batt_ch = bas->createCharacteristic(
+      BLEUUID((uint16_t)0x2A19),
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  bas->start();
+  // NOT advertised: a 2nd 128-bit UUID won't fit the 31-byte adv budget (see the
+  // ANCS note below). Gadgetbridge identifies a Bangle.js by NAME, then discovers
+  // NUS over GATT — advertising it isn't needed.
 
   BLEAdvertising *adv = BLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_SVC_UUID);
@@ -316,16 +441,55 @@ static void ble_end(void) {
 
   s_ble_server  = nullptr;
   s_ble_find_ch = nullptr;
+  s_ble_batt_ch = nullptr;
+  gb_set_tx(nullptr);                         // NUS TX characteristic died with the server
+  gb_reset();
   USBSerial.println("[ble] down");
 }
 
-/* Find-My-Phone: notify a connected+subscribed phone app so it can ring. No-op if
- * BLE is down or nothing is subscribed. (For the future Find-My-Phone app.) */
+/* Find-My-Phone: ring the connected phone. Android/Gadgetbridge listens for a
+ * {"t":"findPhone","n":true} line on the NUS TX characteristic; the custom
+ * find-phone characteristic is also notified for a future own companion app.
+ * Returns false only when no phone is connected. */
 static bool ble_ping_phone(void) {
-  if (!s_ble_up || !s_ble_connected || !s_ble_find_ch) return false;
-  s_ble_find_ch->setValue("RING");
-  s_ble_find_ch->notify();
-  return true;
+  if (!s_ble_up || !s_ble_connected) return false;
+  bool ok = gb_send("{\"t\":\"findPhone\",\"n\":true}");   // Gadgetbridge (Android)
+  if (s_ble_find_ch) {                                     // custom companion app
+    s_ble_find_ch->setValue("RING");
+    s_ble_find_ch->notify();
+    ok = true;
+  }
+  return ok;
+}
+
+/* Report the watch battery to the phone, both ways at once:
+ *   - standard Battery Service notify (iPhone: Batteries widget picks it up)
+ *   - Gadgetbridge status line (Android: device card + battery graph + low alerts)
+ * Called from the loop's PMU refresh on %/charger change and once per connection;
+ * cheap enough that over-calling is harmless (the caller change-gates anyway). */
+static void ble_report_battery(int pct, bool charging) {
+  if (!s_ble_up || pct < 0) return;
+  uint8_t v = (pct > 100) ? 100 : (uint8_t)pct;
+  if (s_ble_batt_ch) {
+    s_ble_batt_ch->setValue(&v, 1);           // serves later reads even when idle
+    if (s_ble_connected) s_ble_batt_ch->notify();
+  }
+  char line[48];
+  snprintf(line, sizeof(line), "{\"t\":\"status\",\"bat\":%u,\"chg\":%u}", v, charging ? 1 : 0);
+  gb_send(line);                              // no-op unless a phone is connected
+}
+
+/* Stop the phone ringing (Gadgetbridge rings until dismissed on the phone OR told
+ * to stop — this is the "tap again to stop" path). */
+static bool ble_stop_phone_ring(void) {
+  if (!s_ble_up || !s_ble_connected) return false;
+  bool ok = gb_send("{\"t\":\"findPhone\",\"n\":false}");
+  if (s_ble_find_ch) {
+    s_ble_find_ch->setValue("STOP");
+    s_ble_find_ch->notify();
+    ok = true;
+  }
+  return ok;
 }
 
 /* Find-My-Watch: true once (read-and-clear) when the phone wrote the find-watch
@@ -360,13 +524,73 @@ static bool ble_bond_addr_str(int i, char *buf, size_t cap) {
   return true;
 }
 
+/* Display label for bond i: the cached GAP Device Name if we've captured one for
+ * that phone (NVS "bn"+mac, written on each encrypted connect), else its MAC. */
+static bool ble_bond_label(int i, char *buf, size_t cap) {
+  if (!s_ble_up) return false;
+  ble_addr_t addrs[BLE_BOND_MAX];
+  int n = 0;
+  if (ble_store_util_bonded_peers(addrs, &n, BLE_BOND_MAX) != 0 || i < 0 || i >= n) return false;
+  const uint8_t *v = addrs[i].val;
+  char key[16];
+  snprintf(key, sizeof(key), "bn%02x%02x%02x%02x%02x%02x", v[5], v[4], v[3], v[2], v[1], v[0]);
+  String nm = prefs.getString(key, "");
+  if (nm.length()) { strlcpy(buf, nm.c_str(), cap); return true; }
+  return ble_bond_addr_str(i, buf, cap);   // never connected since this feature: show MAC
+}
+
 /* Forget (unpair) bond index i. Returns true if removed. */
 static bool ble_bond_forget(int i) {
   if (!s_ble_up) return false;
   ble_addr_t addrs[BLE_BOND_MAX];
   int n = 0;
   if (ble_store_util_bonded_peers(addrs, &n, BLE_BOND_MAX) != 0 || i < 0 || i >= n) return false;
-  return ble_gap_unpair(&addrs[i]) == 0;
+
+  // Unpairing the CURRENTLY CONNECTED phone is unreliable while the link is up:
+  // ble_gap_unpair() finds the connection by the address we pass, but the bond list
+  // holds the phone's IDENTITY address while an iPhone connects under a rotating RPA,
+  // so the lookup can miss — the encrypted link survives and NimBLE re-persists the
+  // peer's records (CCCDs etc.), resurrecting the "deleted" bond. If this bond IS the
+  // live connection (match by identity address), drop the link by HANDLE first
+  // (reliable) and let the disconnect settle before deleting the stored bond.
+  if (s_ble_server && s_ble_connected) {
+    struct ble_gap_conn_desc d;
+    if (ble_gap_conn_find(s_ble_server->getConnId(), &d) == 0 &&
+        ble_addr_cmp(&d.peer_id_addr, &addrs[i]) == 0) {
+      s_ble_server->disconnect(s_ble_server->getConnId());
+      for (uint32_t t0 = millis(); s_ble_connected && millis() - t0 < 500; ) delay(10);
+    }
+  }
+
+  int rc = ble_gap_unpair(&addrs[i]);
+  if (rc != 0) {                    // host mid-procedure (EBUSY/EAGAIN etc.): one retry
+    delay(100);
+    rc = ble_gap_unpair(&addrs[i]);
+  }
+  if (rc != 0) { USBSerial.printf("[ble] unpair FAILED rc=%d\n", rc); return false; }
+
+  // Verify the bond is really gone — a still-encrypted peer can re-persist its
+  // records between the delete and our return, which the UI would misread as success.
+  ble_addr_t after[BLE_BOND_MAX];
+  int m = 0;
+  if (ble_store_util_bonded_peers(after, &m, BLE_BOND_MAX) == 0)
+    for (int k = 0; k < m; k++)
+      if (ble_addr_cmp(&after[k], &addrs[i]) == 0) {
+        USBSerial.println("[ble] unpair: bond re-appeared (peer link still up?)");
+        return false;
+      }
+
+  // Drop the per-peer NVS leftovers (cached name, GATT schema version) so a future
+  // re-pair of the same phone starts clean.
+  {
+    const uint8_t *v = addrs[i].val;
+    char key[16];
+    snprintf(key, sizeof(key), "bn%02x%02x%02x%02x%02x%02x", v[5], v[4], v[3], v[2], v[1], v[0]);
+    prefs.remove(key);
+    key[0] = 'g'; key[1] = 'v';
+    prefs.remove(key);
+  }
+  return true;
 }
 
 /* Apply the saved toggle preference: bring BLE up or down to match. Call at boot
@@ -426,6 +650,8 @@ static void ble_ui_tick(void) {
       col = 0x32D74B; snprintf(msg, sizeof(msg), LV_SYMBOL_OK "  WiFi saved\n%s", s_ble_toast_ssid);
     } else if (r == BLE_TOAST_DUP) {
       col = 0xFF9F0A; snprintf(msg, sizeof(msg), LV_SYMBOL_WARNING "  Already saved\n%s", s_ble_toast_ssid);
+    } else if (r == BLE_TOAST_FORGETFAIL) {
+      col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE "  Couldn't forget phone\nTry again");
     } else {
       col = 0xFF453A; snprintf(msg, sizeof(msg), LV_SYMBOL_CLOSE "  Network list full");
     }

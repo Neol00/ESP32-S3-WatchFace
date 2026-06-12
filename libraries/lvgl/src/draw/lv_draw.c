@@ -22,6 +22,7 @@
 #include "../core/lv_global.h"
 #include "../core/lv_refr_private.h"
 #include "../stdlib/lv_string.h"
+#include "../osal/lv_os.h"
 
 /*********************
  *      DEFINES
@@ -37,6 +38,9 @@
  **********************/
 static bool is_independent(lv_layer_t * layer, lv_draw_task_t * t_check, uint8_t draw_unit_id);
 static void cleanup_task(lv_draw_task_t * t, lv_display_t * disp);
+/* ESP32-S3-WatchFace LOCAL PATCH: band-split parallel rendering — see the
+ * implementation above is_independent() for the full story. */
+static lv_draw_task_t * band_split_task(lv_draw_task_t * t);
 static inline size_t get_draw_dsc_size(lv_draw_task_type_t type);
 static lv_draw_task_t * get_first_available_task(lv_layer_t * layer);
 
@@ -51,6 +55,18 @@ static inline uint32_t get_layer_size_kb(uint32_t size_byte)
  *  STATIC VARIABLES
  **********************/
 
+#if LV_USE_OS
+/* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): serializes every
+ * claim/removal on the draw-task lists, because render workers now scan and
+ * claim tasks themselves instead of waiting for the refr thread to assign
+ * them. Held by: the workers' finish+claim section (lv_draw_sw.c), the sw
+ * dispatch_cb's assignment loop, the FINISHED-task removal walk in
+ * lv_draw_dispatch_layer, and the task release at the end of
+ * lv_draw_finalize_task_creation. List INSERTIONS stay lock-free: they only
+ * publish fully-built nodes (state BUILDING) with single pointer stores. */
+lv_mutex_t lv_draw_watch_task_mutex;
+#endif
+
 /**********************
  *      MACROS
  **********************/
@@ -63,6 +79,8 @@ void lv_draw_init(void)
 {
 #if LV_USE_OS
     lv_thread_sync_init(&_draw_info.sync);
+    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch) */
+    lv_mutex_init(&lv_draw_watch_task_mutex);
 #endif
 }
 
@@ -114,7 +132,10 @@ lv_draw_task_t * lv_draw_add_task(lv_layer_t * layer, const lv_area_t * coords, 
     new_task->opa = layer->opa;
     new_task->type = type;
     new_task->draw_dsc = (uint8_t *)new_task + LV_ALIGN_UP(sizeof(lv_draw_task_t), 8);
-    new_task->state = LV_DRAW_TASK_STATE_WAITING;
+    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): the dsc is filled in
+     * AFTER this function returns, but workers scan the list concurrently —
+     * publish the task as BUILDING (unclaimable); finalize releases it. */
+    new_task->state = LV_DRAW_TASK_STATE_BUILDING;
 
     /*Find the tail*/
     if(layer->draw_task_head == NULL) {
@@ -136,6 +157,12 @@ void lv_draw_finalize_task_creation(lv_layer_t * layer, lv_draw_task_t * t)
     LV_PROFILER_DRAW_BEGIN;
     lv_draw_dsc_base_t * base_dsc = t->draw_dsc;
     base_dsc->layer = layer;
+
+    /* ESP32-S3-WatchFace LOCAL PATCH: split big fill/border/arc/label tasks into
+     * two independent clip halves BEFORE evaluation/dispatch, so both SW render
+     * workers can paint one task in parallel. Must happen before any dispatch:
+     * once a worker may hold the task its clip can no longer be shrunk safely. */
+    lv_draw_task_t * t_split = band_split_task(t);
 
     lv_draw_global_info_t * info = &_draw_info;
 
@@ -189,6 +216,27 @@ void lv_draw_finalize_task_creation(lv_layer_t * layer, lv_draw_task_t * t)
             u = u->next;
         }
     }
+
+    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): the task (and its
+     * band clone) sat in BUILDING state so no worker could claim it while the
+     * dsc was being filled and evaluated. Release it now that it's complete.
+     * If no draw unit took it, retire it AND its clone — a forever-pending
+     * task would stall the layer. The mutex pairs with the workers' claim lock
+     * so the dsc writes above are visible before the task becomes claimable. */
+#if LV_USE_OS
+    lv_mutex_lock(&lv_draw_watch_task_mutex);
+#endif
+    if(t->preferred_draw_unit_id == LV_DRAW_UNIT_NONE) {
+        t->state = LV_DRAW_TASK_STATE_FINISHED;
+        if(t_split) t_split->state = LV_DRAW_TASK_STATE_FINISHED;
+    }
+    else {
+        if(t->state == LV_DRAW_TASK_STATE_BUILDING) t->state = LV_DRAW_TASK_STATE_WAITING;
+        if(t_split && t_split->state == LV_DRAW_TASK_STATE_BUILDING) t_split->state = LV_DRAW_TASK_STATE_WAITING;
+    }
+#if LV_USE_OS
+    lv_mutex_unlock(&lv_draw_watch_task_mutex);
+#endif
     LV_PROFILER_DRAW_END;
 }
 
@@ -235,6 +283,12 @@ bool lv_draw_dispatch_layer(lv_display_t * disp, lv_layer_t * layer)
 {
     LV_PROFILER_DRAW_BEGIN;
     /*Remove the finished tasks first*/
+    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): unlinking + freeing
+     * must not run under a worker that is scanning the same list — take the
+     * shared task mutex for the removal walk. */
+#if LV_USE_OS
+    lv_mutex_lock(&lv_draw_watch_task_mutex);
+#endif
     lv_draw_task_t * t_prev = NULL;
     lv_draw_task_t * t = layer->draw_task_head;
     lv_draw_task_t * t_next;
@@ -254,6 +308,9 @@ bool lv_draw_dispatch_layer(lv_display_t * disp, lv_layer_t * layer)
         }
         t = t_next;
     }
+#if LV_USE_OS
+    lv_mutex_unlock(&lv_draw_watch_task_mutex);
+#endif
 
     bool task_dispatched = false;
 
@@ -340,9 +397,12 @@ lv_draw_task_t * lv_draw_get_next_available_task(lv_layer_t * layer, lv_draw_tas
         int32_t hor_res = lv_display_get_horizontal_resolution(lv_refr_get_disp_refreshing());
         int32_t ver_res = lv_display_get_vertical_resolution(lv_refr_get_disp_refreshing());
         lv_draw_task_t * t = layer->draw_task_head;
+        /* ESP32-S3-WatchFace LOCAL PATCH: judge by _real_area (area ∩ clip), not
+         * area — a band-split screen fill only OCCUPIES its half, so the other
+         * half's tasks stay available to the second worker. */
         if(t->state != LV_DRAW_TASK_STATE_WAITING &&
-           t->area.x1 <= 0 && t->area.x2 >= hor_res - 1 &&
-           t->area.y1 <= 0 && t->area.y2 >= ver_res - 1) {
+           t->_real_area.x1 <= 0 && t->_real_area.x2 >= hor_res - 1 &&
+           t->_real_area.y1 <= 0 && t->_real_area.y2 >= ver_res - 1) {
             LV_PROFILER_DRAW_END;
             return NULL;
         }
@@ -375,8 +435,9 @@ uint32_t lv_draw_get_dependent_count(lv_draw_task_t * t_check)
 
     lv_draw_task_t * t = t_check->next;
     while(t) {
+        /* ESP32-S3-WatchFace LOCAL PATCH: _real_area, consistent with is_independent */
         if((t->state == LV_DRAW_TASK_STATE_WAITING || t->state == LV_DRAW_TASK_STATE_BLOCKED) &&
-           lv_area_is_on(&t_check->area, &t->area)) {
+           lv_area_is_on(&t_check->_real_area, &t->_real_area)) {
             cnt++;
         }
 
@@ -585,6 +646,126 @@ void lv_draw_layer_finish_drop_shadow(lv_layer_t * drop_shadow_layer, const lv_d
  * @param draw_unit_id  draw unit ID for which the independence check is called
  * @return              true: `t_check` is not overlapping with older tasks so it's independent
  */
+/* ESP32-S3-WatchFace LOCAL PATCH: band-split parallel rendering.
+ *
+ * LVGL's parallelism is per draw TASK, and a task may only run when no earlier
+ * task overlapping it is unfinished. A watch UI is a stack of overlapping
+ * widgets over a full-screen background fill, so the task graph degenerates to
+ * a near-serial chain and the 2nd draw unit mostly waits (measured: FPS flat
+ * with 1 vs 2 workers, neither core saturated).
+ *
+ * Fix: clone a big task and give each sibling one HALF of its effective
+ * (area ∩ clip) region as clip_area/_real_area. A task can only touch
+ * pixels inside its clip, so the halves are truly independent: is_independent()
+ * (which compares _real_area) lets both workers paint the same task at once.
+ * Output is pixel-identical: the geometry (t->area — corners, gradients, text
+ * layout) is untouched, only the clip is halved, and the two clips tile the
+ * original exactly.
+ *
+ * Split policy per task type:
+ *  - FILL / BORDER / ARC: horizontal bands. Pure geometry, dsc owns no heap
+ *    resources (see cleanup_task: only LINE, LAYER and label text do), so a
+ *    memcpy clone is safe to create and free through normal task cleanup.
+ *  - LABEL (80% of render time on this UI): split along the LONGER axis.
+ *    Multi-line (tall) labels band horizontally — whole lines outside the clip
+ *    are skipped before any glyph work. Single-line (wide) labels split
+ *    vertically — draw_letter skips a glyph whose letter area AND bg cell are
+ *    outside the clip BEFORE fetching its bitmap, so each half only pays
+ *    look+fetch+blend for its own glyphs (the straddling boundary glyph is
+ *    fetched twice; the decoded-glyph cache makes that ~15 µs). Two dsc
+ *    fix-ups are required: `hint` points at the widget's shared hint storage
+ *    (both halves would write it concurrently → clone gets NULL), and
+ *    `text_local` text is freed once per task by cleanup_task (clone gets its
+ *    own lv_strdup so each sibling frees its own copy).
+ *  - NOT split: IMAGE (raw blits are bandwidth-bound like fills = no gain, and
+ *    decoded sources would decode twice), BOX_SHADOW (each half would redo the
+ *    full blur), LINE (dsc heap ownership), LAYER (blend ordering). */
+static lv_draw_task_t * band_split_task(lv_draw_task_t * t)
+{
+    /* NOTE: _draw_info.unit_cnt counts registered draw UNITS and the sw renderer
+     * registers ONE unit owning LV_DRAW_SW_DRAW_UNIT_CNT worker THREADS — gating
+     * on unit_cnt silently disabled this whole patch. Gate on the thread count. */
+#if !defined(LV_DRAW_SW_DRAW_UNIT_CNT) || LV_DRAW_SW_DRAW_UNIT_CNT < 2
+    return NULL;
+#endif
+
+    switch(t->type) {
+        case LV_DRAW_TASK_TYPE_FILL:
+        case LV_DRAW_TASK_TYPE_BORDER:
+        case LV_DRAW_TASK_TYPE_ARC:
+        case LV_DRAW_TASK_TYPE_LABEL:
+            break;
+        default:
+            return NULL;
+    }
+
+    /* LV_EVENT_DRAW_TASK_ADDED handlers may mutate the dsc after cloning,
+     * which would let the halves diverge — don't split those objects' tasks. */
+    lv_draw_dsc_base_t * base_dsc = t->draw_dsc;
+    if(base_dsc->obj && lv_obj_has_flag(base_dsc->obj, LV_OBJ_FLAG_SEND_DRAW_TASK_EVENTS)) return NULL;
+
+    lv_area_t eff;
+    if(!lv_area_intersect(&eff, &t->area, &t->clip_area)) return NULL;
+    int32_t eff_w = lv_area_get_width(&eff);
+    int32_t eff_h = lv_area_get_height(&eff);
+
+    bool vertical = false;   /* split into left/right instead of top/bottom */
+    if(t->type == LV_DRAW_TASK_TYPE_LABEL) {
+        /* Labels are ~1 ms each and the serial bottleneck, so split much
+         * smaller ones than fills — but each half re-runs the line layout,
+         * so don't split below the dispatch+layout overhead. */
+        if(eff_w * eff_h < 4096) return NULL;
+        vertical = eff_w > eff_h;
+        if(vertical ? eff_w < 64 : eff_h < 32) return NULL;  /* halves too thin */
+    }
+    else {
+        if(eff_h < 16) return NULL;                  /* too thin to band */
+        if(eff_w * eff_h < 16384) return NULL;       /* not worth 2 dispatches */
+    }
+
+    size_t size = LV_ALIGN_UP(sizeof(lv_draw_task_t), 8) + get_draw_dsc_size(t->type);
+    lv_draw_task_t * c = lv_malloc(size);
+    if(c == NULL) return NULL;
+    lv_memcpy(c, t, size);
+    c->draw_dsc = (uint8_t *)c + LV_ALIGN_UP(sizeof(lv_draw_task_t), 8);
+    c->preference_score = 100;
+    c->preferred_draw_unit_id = LV_DRAW_UNIT_NONE;   /* any worker may take it */
+
+    if(t->type == LV_DRAW_TASK_TYPE_LABEL) {
+        lv_draw_label_dsc_t * ld = (lv_draw_label_dsc_t *)c->draw_dsc;
+        ld->hint = NULL;                 /* shared widget storage — not thread-safe */
+        if(ld->text_local) {
+            char * dup = lv_strdup(ld->text);   /* cleanup_task frees per task */
+            if(dup == NULL) {
+                lv_free(c);
+                return NULL;
+            }
+            ld->text = dup;
+        }
+    }
+
+    if(vertical) {
+        int32_t x_mid = (eff.x1 + eff.x2) >> 1;
+        t->clip_area = eff;
+        t->clip_area.x2 = x_mid;                      /* original: left half */
+        c->clip_area = eff;
+        c->clip_area.x1 = x_mid + 1;                  /* clone: right half */
+    }
+    else {
+        int32_t y_mid = (eff.y1 + eff.y2) >> 1;
+        t->clip_area = eff;
+        t->clip_area.y2 = y_mid;                      /* original: top band */
+        c->clip_area = eff;
+        c->clip_area.y1 = y_mid + 1;                  /* clone: bottom band */
+    }
+    t->_real_area = t->clip_area;
+    c->_real_area = c->clip_area;
+
+    c->next = t->next;                                /* insert right after t */
+    t->next = c;
+    return c;
+}
+
 static bool is_independent(lv_layer_t * layer, lv_draw_task_t * t_check, uint8_t draw_unit_id)
 {
     LV_PROFILER_DRAW_BEGIN;

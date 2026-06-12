@@ -5,8 +5,8 @@
  *  lowers the chip's ACTUAL digital-core voltage by overriding the `dig_dbias`
  *  trim that ESP-IDF programs into the on-die LDO. Power ~ V^2, so dropping the
  *  core from 1.25V to 1.15V at 240 MHz cuts core dynamic power ~15%. The biggest
- *  wins are at LOW clocks: IDF leaves 80/120/160 MHz at 1.25V too (when flash is
- *  80/120 MHz, which this board uses), so they're badly over-volted by default.
+ *  wins are at LOW clocks: IDF leaves 80/160 MHz at 1.25V too (when flash is
+ *  80/160 MHz, which this board uses), so they're badly over-volted by default.
  *
  *  ---------------------------------------------------------------------------
  *  HOW TO TUNE: edit CORE_UV_MV[] below — just type the core voltage you want
@@ -16,10 +16,6 @@
  *  "give 80 MHz roughly 1.1 V". Lower number = more undervolt = more savings and
  *  more risk. That's the whole knob.
  *  ---------------------------------------------------------------------------
- *
- *  Supported steps (chip's dbias grid, from soc/rtc.h):
- *      900  950  1000  1050  1100  1150  1200  1250(stock)  1300(~1.34V real)
- *  Anything in between snaps to the nearest of these.
  *
  *  MECHANISM: the active digital-core voltage is the I2C_DIG_REG_EXT_DIG_DREG
  *  field of the analog "regi2c" block (I2C_DIG_REG = 0x6D). setCpuFrequencyMhz()
@@ -60,7 +56,7 @@ typedef struct { uint16_t mhz; uint16_t mv; } core_uv_entry_t;
 static const core_uv_entry_t CORE_UV_MV[] = {
   { 240, 1250 },   // stock
   { 160, 1250 },   // over-volted by default -> good headroom
-  {  80, 1250  },   // most over-volted -> lots of room to drop
+  {  80, 1250 },   // most over-volted -> lots of room to drop
 };
 static const uint8_t CORE_UV_COUNT = sizeof(CORE_UV_MV) / sizeof(CORE_UV_MV[0]);
 

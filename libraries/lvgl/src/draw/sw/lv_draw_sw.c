@@ -39,6 +39,12 @@
  *********************/
 #define DRAW_UNIT_ID_SW     1
 
+#if LV_USE_OS
+/* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): defined in lv_draw.c.
+ * Guards task claim/removal on the layers' draw-task lists. */
+extern lv_mutex_t lv_draw_watch_task_mutex;
+#endif
+
 /**********************
  *      TYPEDEFS
  **********************/
@@ -260,6 +266,11 @@ static int32_t dispatch(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
      * Otherwise return taken_cnt;
      */
 
+    /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch): workers claim
+     * tasks themselves under the same mutex — assignment must be exclusive
+     * with them or a thread's task_act could be double-assigned. */
+    lv_mutex_lock(&lv_draw_watch_task_mutex);
+
     /*If at least one is busy, it's not all idle*/
     bool all_idle = true;
     for(i = 0; i < LV_DRAW_SW_DRAW_UNIT_CNT; i++) {
@@ -282,6 +293,7 @@ static int32_t dispatch(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
         /*If there is not available task don't try other threads as there won't be available
          *tasks for then either*/
         if(t == NULL) {
+            lv_mutex_unlock(&lv_draw_watch_task_mutex);
             LV_PROFILER_DRAW_END;
             if(all_idle) return LV_DRAW_UNIT_IDLE;  /*Couldn't start rendering*/
             else return taken_cnt;
@@ -302,6 +314,7 @@ static int32_t dispatch(lv_draw_unit_t * draw_unit, lv_layer_t * layer)
         if(thread_dsc->inited) lv_thread_sync_signal(&thread_dsc->sync);
     }
 
+    lv_mutex_unlock(&lv_draw_watch_task_mutex);
     LV_PROFILER_DRAW_END;
     if(all_idle) return LV_DRAW_UNIT_IDLE;  /*Couldn't start rendering*/
     else return taken_cnt;
@@ -367,10 +380,58 @@ static void render_thread_cb(void * ptr)
 #if LV_USE_PARALLEL_DRAW_DEBUG
         parallel_debug_draw(thread_dsc->task_act, thread_dsc->idx);
 #endif
-        thread_dsc->task_act->state = LV_DRAW_TASK_STATE_FINISHED;
-        thread_dsc->task_act = NULL;
 
-        /*The draw unit is free now. Request a new dispatching as it can get a new task*/
+        /* ESP32-S3-WatchFace LOCAL PATCH (worker self-dispatch).
+         *
+         * Upstream a worker goes idle here and waits for the refr thread to
+         * assign its next task — every task round-trips through the refr
+         * thread, which on this watch shares a core with (and runs BELOW) a
+         * render worker. Measured: a worker sat idle ~half of each frame
+         * waiting for dispatch (IDLE0 48% during heavy scroll).
+         *
+         * Instead: under the shared task mutex, mark the finished task, then
+         * directly claim the next available task of the same layer for
+         * ourselves, and hand further available tasks to idle sibling
+         * threads. The refr thread is still woken (dispatch_request) but only
+         * for cleanup, layer blending and refresh progression — it is no
+         * longer on the critical path between two tasks.
+         *
+         * The layer pointer stays valid through this block: our just-finished
+         * task can only be cleaned up by lv_draw_dispatch_layer, which takes
+         * the same mutex. */
+        {
+            lv_layer_t * task_layer = thread_dsc->task_act->target_layer;
+            lv_draw_sw_unit_t * u_self = (lv_draw_sw_unit_t *)thread_dsc->draw_unit;
+
+            lv_mutex_lock(&lv_draw_watch_task_mutex);
+            thread_dsc->task_act->state = LV_DRAW_TASK_STATE_FINISHED;
+            thread_dsc->task_act = NULL;
+
+            if(task_layer->draw_buf != NULL) {
+                lv_draw_task_t * t_self = lv_draw_get_next_available_task(task_layer, NULL, DRAW_UNIT_ID_SW);
+                if(t_self != NULL) {
+                    t_self->state = LV_DRAW_TASK_STATE_IN_PROGRESS;
+                    thread_dsc->task_act = t_self;
+
+                    /*Feed idle siblings while we're at it — they'd otherwise
+                     *also wait for the refr thread.*/
+                    uint32_t s;
+                    for(s = 0; s < LV_DRAW_SW_DRAW_UNIT_CNT; s++) {
+                        lv_draw_sw_thread_dsc_t * sib = &u_self->thread_dscs[s];
+                        if(sib == thread_dsc || sib->task_act != NULL || !sib->inited || sib->exit_status) continue;
+                        lv_draw_task_t * t_sib = lv_draw_get_next_available_task(task_layer, NULL, DRAW_UNIT_ID_SW);
+                        if(t_sib == NULL) break;
+                        t_sib->state = LV_DRAW_TASK_STATE_IN_PROGRESS;
+                        sib->task_act = t_sib;
+                        lv_thread_sync_signal(&sib->sync);
+                    }
+                }
+            }
+            lv_mutex_unlock(&lv_draw_watch_task_mutex);
+        }
+
+        /*Wake the refr thread for cleanup of finished tasks, layer blending
+         *and refresh progression (and dispatching if we found nothing).*/
         lv_draw_dispatch_request();
 
     }
@@ -381,9 +442,19 @@ static void render_thread_cb(void * ptr)
 }
 #endif
 
+/* ESP32-S3-WatchFace LOCAL PATCH: per-task-type render-time accounting, indexed
+ * by lv_draw_task_type_t. Read + reset from the sketch's serial profiler to see
+ * WHERE frame time goes (fill vs label vs image vs layer-blend). Updated from
+ * both render workers without locking — a lost sample under a race is fine for
+ * diagnostics. Costs two esp_timer reads per task; zero when nobody reads it. */
+#include "esp_timer.h"
+uint32_t g_lv_draw_type_us[20];
+uint32_t g_lv_draw_type_cnt[20];
+
 static void execute_drawing(lv_draw_task_t * t)
 {
     LV_PROFILER_DRAW_BEGIN;
+    uint32_t watch_t0 = (uint32_t)esp_timer_get_time(); /* LOCAL PATCH */
     /*Render the draw task*/
     switch(t->type) {
         case LV_DRAW_TASK_TYPE_FILL:
@@ -431,6 +502,13 @@ static void execute_drawing(lv_draw_task_t * t)
             break;
     }
 
+    /* LOCAL PATCH: accumulate render time per task type (see above) */
+    {
+        uint32_t watch_ty = (uint32_t)t->type;
+        if(watch_ty >= 20) watch_ty = 19;
+        g_lv_draw_type_us[watch_ty] += (uint32_t)esp_timer_get_time() - watch_t0;
+        g_lv_draw_type_cnt[watch_ty]++;
+    }
 
     LV_PROFILER_DRAW_END;
 }
